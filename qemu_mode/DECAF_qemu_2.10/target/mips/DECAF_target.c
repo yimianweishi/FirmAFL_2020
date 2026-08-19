@@ -29,36 +29,95 @@ http://code.google.com/p/decaf-platform/
 #include "DECAF_target.h"
 #include "shared/linux_vmi_new.h"
 
+static bool mips_kseg_to_phys(target_ulong address, gpa_t *physical)
+{
+  if (address >= 0x80000000 && address < 0xa0000000) {
+    *physical = address - 0x80000000;
+    return true;
+  }
+  if (address >= 0xa0000000 && address < 0xc0000000) {
+    *physical = address - 0xa0000000;
+    return true;
+  }
+  return false;
+}
+
+DECAF_GVATranslationStatus DECAF_get_phys_addr_with_pgd_status(
+    CPUState *env, gpa_t pgd, gva_t addr, gpa_t *physical)
+{
+  CPUArchState *env_ptr;
+  target_ulong pgd_entry;
+  target_ulong pte;
+  target_ulong entrylo;
+  gpa_t pgd_phys;
+  gpa_t pte_table_phys;
+  gpa_t phys_page;
+  int softshift;
+
+  if (env == NULL) {
+#ifdef DECAF_NO_FAIL_SAFE
+    return DECAF_GVA_WALK_ERROR;
+#else
+    env = current_cpu ? current_cpu : first_cpu;
+#endif
+  }
+  if (env == NULL) {
+    return DECAF_GVA_WALK_ERROR;
+  }
+
+  /* KSEG0 and KSEG1 are direct mapped and never require a TLB entry. */
+  if (mips_kseg_to_phys(addr, &phys_page)) {
+    *physical = phys_page;
+    return DECAF_GVA_TRANSLATED;
+  }
+
+  if (mips_kseg_to_phys(pgd, &pgd_phys)) {
+    pgd = pgd_phys;
+  }
+  if (pgd == 0 || pgd == INV_ADDR) {
+    return DECAF_GVA_WALK_ERROR;
+  }
+
+  /* Linux/MIPS32 uses a two-level table: 10 PGD and 10 PTE index bits. */
+  pgd_entry = ldl_phys(env->as, pgd + (((target_ulong)addr >> 22) * 4));
+  if (pgd_entry == 0) {
+    return DECAF_GVA_NOT_PRESENT;
+  }
+  if (!mips_kseg_to_phys(pgd_entry, &pte_table_phys)) {
+    return DECAF_GVA_WALK_ERROR;
+  }
+
+  pte = ldl_phys(env->as, pte_table_phys +
+                 ((((target_ulong)addr >> 12) & 0x3ff) * 4));
+  /* Bit zero is Linux _PAGE_PRESENT; a nonzero swap PTE is not mapped RAM. */
+  if (!(pte & 1)) {
+    return DECAF_GVA_NOT_PRESENT;
+  }
+
+  /* The kernel refill handler defines how its software PTE becomes EntryLo. */
+  softshift = mips_get_pte_softshift(env);
+  if (softshift <= 0 || softshift > 25) {
+    return DECAF_GVA_WALK_ERROR;
+  }
+  entrylo = pte >> softshift;
+  phys_page = ((gpa_t)((entrylo >> 6) & 0x00ffffff)) << TARGET_PAGE_BITS;
+  env_ptr = (CPUArchState *)env->env_ptr;
+  if ((phys_page & ~env_ptr->PAMask) != 0) {
+    return DECAF_GVA_WALK_ERROR;
+  }
+  *physical = phys_page | ((target_ulong)addr & ~TARGET_PAGE_MASK);
+  return DECAF_GVA_TRANSLATED;
+}
+
 gpa_t DECAF_get_phys_addr_with_pgd(CPUState* env, gpa_t pgd, gva_t addr)
 {
+  gpa_t physical;
 
-  //zyw
-  monitor_printf(cur_mon, "ERROR: DECAF_get_phys_addr_with_pgd doesn't work for MIPS.\n");
-  return -1;
-
-//   if (env == NULL)
-//   {
-// #ifdef DECAF_NO_FAIL_SAFE
-//     return (INV_ADDR);
-// #else
-//     env = cpu_single_env ? cpu_single_env : first_cpu;
-// #endif
-//   }
-
-
-//   gpa_t old = env->CP0_EntryLo0;
-//   gpa_t old1 = env->CP0_EntryLo1;
-//   gpa_t phys_addr;
-
-//   env->CP0_EntryLo0 = pgd;
-//   env->CP0_EntryLo1 = pgd;
-
-//   phys_addr = cpu_get_phys_page_debug(env, addr & TARGET_PAGE_MASK);
-
-//   env->CP0_EntryLo0 = old;
-//   env->CP0_EntryLo1 = old1;
-
-//   return (phys_addr | (addr & (~TARGET_PAGE_MASK)));
+  if (DECAF_get_phys_addr_with_pgd_status(env, pgd, addr, &physical) !=
+      DECAF_GVA_TRANSLATED) {
+    return INV_ADDR;
+  }
+  return physical;
 }
 
 

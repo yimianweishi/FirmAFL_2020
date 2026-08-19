@@ -31,14 +31,16 @@
 
 #include "qemu/memfd.h"
 
-//#ifdef CONFIG_MEMFD
-//#include <sys/memfd.h>
-//#elif defined CONFIG_LINUX
-#if defined CONFIG_LINUX && !defined CONFIG_MEMFD
+#if defined CONFIG_LINUX
 #include <sys/syscall.h>
 #include <asm/unistd.h>
 
-static int memfd_create(const char *name, unsigned int flags)
+/*
+ * Some of the legacy FirmAFL build images expose a memfd_create declaration
+ * while their libc does not export the symbol.  Use the Linux syscall directly
+ * so the collector remains linkable on those images.
+ */
+static int qemu_memfd_create(const char *name, unsigned int flags)
 {
 #ifdef __NR_memfd_create
     return syscall(__NR_memfd_create, name, flags);
@@ -72,12 +74,12 @@ void *qemu_memfd_alloc(const char *name, size_t size, unsigned int seals,
 
 #ifdef CONFIG_LINUX
     if (seals) {
-        mfd = memfd_create(name, MFD_ALLOW_SEALING | MFD_CLOEXEC);
+        mfd = qemu_memfd_create(name, MFD_ALLOW_SEALING | MFD_CLOEXEC);
     }
 
     if (mfd == -1) {
         /* some systems have memfd without sealing */
-        mfd = memfd_create(name, MFD_CLOEXEC);
+        mfd = qemu_memfd_create(name, MFD_CLOEXEC);
         seals = 0;
     }
 #endif

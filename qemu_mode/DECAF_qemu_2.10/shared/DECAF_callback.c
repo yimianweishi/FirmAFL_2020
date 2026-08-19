@@ -254,11 +254,12 @@ int DECAF_is_BlockEndCallback_needed(gva_t from, gva_t to)
   return (CountingHashmap_exist(pOBEPageMap, from, to));
 }
 
-DECAF_Handle DECAF_registerOptimizedBlockBeginCallback(
+static DECAF_Handle DECAF_registerOptimizedBlockBeginCallbackInternal(
     DECAF_callback_func_t cb_func,
     int *cb_cond,
     gva_t addr,
-    OCB_t type)
+    OCB_t type,
+    bool preserve_const)
 {
   callback_struct_t * cb_struct = (callback_struct_t *)malloc(sizeof(callback_struct_t));
   if (cb_struct == NULL)
@@ -266,8 +267,10 @@ DECAF_Handle DECAF_registerOptimizedBlockBeginCallback(
     return (DECAF_NULL_HANDLE);
   }
   
-  //Heng: Optimization on OCB_CONST is not stable. We use OCB_ALL instead for now.
-  if (type == OCB_CONST) type = OCB_ALL;
+  // Preserve the legacy behavior for existing plugins.  QRR uses the exact
+  // entry point below because target discovery must not install an all-TB
+  // business callback.
+  if (!preserve_const && type == OCB_CONST) type = OCB_ALL;
 
   //pre-populate the info
   cb_struct->callback = cb_func;
@@ -340,6 +343,25 @@ DECAF_Handle DECAF_registerOptimizedBlockBeginCallback(
   LIST_INSERT_HEAD(&callback_list_heads[DECAF_BLOCK_BEGIN_CB], cb_struct, link);
 
   return ((DECAF_Handle)cb_struct);
+}
+
+DECAF_Handle DECAF_registerOptimizedBlockBeginCallback(
+    DECAF_callback_func_t cb_func,
+    int *cb_cond,
+    gva_t addr,
+    OCB_t type)
+{
+  return DECAF_registerOptimizedBlockBeginCallbackInternal(
+      cb_func, cb_cond, addr, type, false);
+}
+
+DECAF_Handle DECAF_registerExactBlockBeginCallback(
+    DECAF_callback_func_t cb_func,
+    int *cb_cond,
+    gva_t addr)
+{
+  return DECAF_registerOptimizedBlockBeginCallbackInternal(
+      cb_func, cb_cond, addr, OCB_CONST, true);
 }
 
 //Aravind - Function to register cb handlers for instruction ranges
@@ -1250,4 +1272,3 @@ void DECAF_callback_init(void)
   bEnableAllBlockEndCallbacks = 0;
   enableAllBlockEndCallbacksCount = 0;
 }
-

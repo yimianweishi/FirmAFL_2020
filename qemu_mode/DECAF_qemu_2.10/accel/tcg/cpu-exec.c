@@ -961,9 +961,42 @@ bool delete_pgd(int pgd)
     return FALSE;
 }
 
+/* Full-system QRR v12 includes execution/process-isolated replay keys. */
+#include "qrr-full-tcg.h"
+
+static DECAF_Handle qrr_exec_connector_handle = DECAF_NULL_HANDLE;
+
+static void qrr_exec_connector_callback(DECAF_Callback_Params *params)
+{
+#ifdef TARGET_MIPS
+    CPUState *cpu;
+    CPUArchState *env;
+    target_ulong pc;
+    target_ulong task;
+
+    if (!params) {
+        return;
+    }
+    cpu = params->bb.env;
+    pc = params->bb.tb ? params->bb.tb->pc : 0;
+    if (pc != qrr_full_exec_connector_address()) {
+        fprintf(stderr,
+                "qrr-full: unexpected exec hook PC=" TARGET_FMT_lx
+                " expected=" TARGET_FMT_lx "\n",
+                pc, qrr_full_exec_connector_address());
+        exit(2);
+    }
+    env = cpu->env_ptr;
+    task = env->active_tc.gpr[4];
+    qrr_full_note_exec_connector(cpu, task);
+#else
+    (void)params;
+#endif
+}
+
 static void callbacktests_loadmainmodule_callback(VMI_Callback_Params* params)
 {
-    char procname[64];
+    char procname[64] = { 0 };
     uint32_t pid;
     uint32_t par_pid;
     if (params == NULL)
@@ -982,6 +1015,8 @@ static void callbacktests_loadmainmodule_callback(VMI_Callback_Params* params)
     int par_cr3;
     VMI_find_process_by_pid_c(par_pid, par_proc_name, 100, &par_cr3);
     //DECAF_printf("parent proc:%s\n", par_proc_name);
+    qrr_full_note_process_identity(params->cp.cr3 & 0xfffff000,
+                                   procname, pid, par_pid);
 #if defined(FUZZ) || defined(MEM_MAPPING)
     if(strcmp(procname,program_analysis) == 0 &&strstr(procname,"S") == NULL&& strstr(procname,".sh") == NULL && strstr(par_proc_name, "procd") == NULL)
     { 
@@ -1031,6 +1066,7 @@ static void callbacktests_removeproc_callback(VMI_Callback_Params* params)
     {
         return;
     }
+    qrr_full_unbind_process(params->rp.cr3 & 0xfffff000, procname);
     //DECAF_printf("\nProcname end:%s/%d,pid:%d, cur pgd:%x\n",procname, index, pid, params->rp.cr3);
 #if defined(FUZZ) || defined(MEM_MAPPING)
     if(strcmp(procname,program_analysis) == 0)
@@ -1044,8 +1080,38 @@ static void callbacktests_removeproc_callback(VMI_Callback_Params* params)
 
 int callbacktests_init(void)
 {
+    target_ulong exec_connector;
+
     DECAF_output_init(NULL);
     DECAF_printf("Hello World\n");
+    if (qrr_full_init()) {
+#ifndef TARGET_MIPS
+        fprintf(stderr,
+                "qrr-full: direct proc_exec_connector target selection"
+                " currently requires MIPS\n");
+        exit(2);
+#endif
+        exec_connector = qrr_full_exec_connector_address();
+        if (!exec_connector) {
+            fprintf(stderr,
+                    "qrr-full: proc_exec_connector address unavailable\n");
+            exit(2);
+        }
+        qrr_exec_connector_handle =
+            DECAF_registerExactBlockBeginCallback(
+                &qrr_exec_connector_callback, NULL, exec_connector);
+        if (qrr_exec_connector_handle == DECAF_NULL_HANDLE) {
+            fprintf(stderr,
+                    "qrr-full: cannot register proc_exec_connector hook at "
+                    TARGET_FMT_lx "\n", exec_connector);
+            exit(2);
+        }
+        fprintf(stderr,
+                "qrr-full: registered sole target-discovery TB hook"
+                " proc_exec_connector=" TARGET_FMT_lx "\n",
+                exec_connector);
+        return 0;
+    }
     processbegin_handle = VMI_register_callback(VMI_CREATEPROC_CB, &callbacktests_loadmainmodule_callback, NULL);
     removeproc_handle = VMI_register_callback(VMI_REMOVEPROC_CB, &callbacktests_removeproc_callback, NULL);
 
@@ -1184,6 +1250,8 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
         qemu_log_unlock();
     }
 #endif /* DEBUG_DISAS */
+
+    qrr_full_note_tb(cpu, itb->pc);
 
     cpu->can_do_io = !use_icount;
 
@@ -2706,6 +2774,10 @@ int cpu_exec(CPUState *cpu)
 #elif defined(TARGET_ARM)
 #endif
 
+    if (cpu->exception_index == exception_num) {
+        qrr_full_syscall_entry(cpu);
+    }
+
 #if defined(FUZZ) || defined(MEM_MAPPING)
 
     //if(afl_user_fork == 0 && cpu->exception_index == exception_num && into_syscall == 0)
@@ -2848,6 +2920,8 @@ skip_to_pos:
             target_ulong pc = env->regs[15];
             target_ulong stack = env->regs[13]; //???????
 #endif
+
+            qrr_full_syscall_return(cpu, pc, stack);
 
 #ifdef FUZZ
 #ifdef FORK_OR_NOT

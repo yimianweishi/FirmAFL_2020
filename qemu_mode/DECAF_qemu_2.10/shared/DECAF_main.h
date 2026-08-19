@@ -126,6 +126,15 @@ extern gpa_t DECAF_get_phys_addr(CPUState* env, gva_t addr);
 
 extern gpa_t DECAF_get_phys_addr_with_pgd(CPUState* env, gpa_t pgd, gva_t addr);
 
+typedef enum DECAF_GVATranslationStatus {
+    DECAF_GVA_WALK_ERROR = -1,
+    DECAF_GVA_TRANSLATED = 0,
+    DECAF_GVA_NOT_PRESENT = 1,
+} DECAF_GVATranslationStatus;
+
+extern DECAF_GVATranslationStatus DECAF_get_phys_addr_with_pgd_status(
+    CPUState *env, gpa_t pgd, gva_t addr, gpa_t *physical);
+
 //wrapper -- pgd is the generic term while cr3 is the register in x86
 #define  DECAF_get_physaddr_with_cr3(_env, _pgd, _addr) DECAF_get_phys_addr_with_pgd(_env, _pgd, _addr)
 
@@ -275,4 +284,3 @@ extern void do_send_key(const char *string);
 #endif
 
 #endif /* DECAF_MAIN_H_ */
-

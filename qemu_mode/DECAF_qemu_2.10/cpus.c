@@ -69,6 +69,19 @@ extern void handlePiperead(void *ctx);
 //zyw
 extern void spawn_thread_after_fork();
 
+#if defined(FUZZ) || defined(MEM_MAPPING)
+static bool qrr_capture_requested(void)
+{
+    const char *qrr_path = getenv("QRR_FULL_TCG_QRR");
+    const char *event_path = getenv("QRR_FULL_TCG_EVENTS");
+    const char *exec_path = getenv("QRR_FULL_TCG_EXECS");
+
+    return (qrr_path && qrr_path[0]) ||
+           (event_path && event_path[0]) ||
+           (exec_path && exec_path[0]);
+}
+#endif
+
 #ifdef CONFIG_LINUX
 
 #include <sys/prctl.h>
@@ -2247,7 +2260,9 @@ gotPipeNotification(void *ctx)
 void qemu_init_vcpu(CPUState *cpu)
 {
 #if defined(FUZZ) || defined(MEM_MAPPING) 
-    FirmAFL_config();
+    if (!qrr_capture_requested()) {
+        FirmAFL_config();
+    }
 #endif
 #ifdef MEM_MAPPING
     int res = open_read_pipe();
@@ -2261,12 +2276,13 @@ void qemu_init_vcpu(CPUState *cpu)
 #endif
 
 #ifdef FUZZ   
-
-    if(pipe(afl_qemuloop_pipe) == -1) {
-        perror("qemuloop pipe");
-        exit(1);
+    if (!qrr_capture_requested()) {
+        if(pipe(afl_qemuloop_pipe) == -1) {
+            perror("qemuloop pipe");
+            exit(1);
+        }
+        qemu_set_fd_handler(afl_qemuloop_pipe[0], gotPipeNotification, NULL, NULL);
     }
-    qemu_set_fd_handler(afl_qemuloop_pipe[0], gotPipeNotification, NULL, NULL);
 #endif
 
     cpu->nr_cores = smp_cores;

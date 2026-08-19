@@ -61,6 +61,11 @@ extern DECAF_Handle DECAF_registerOptimizedBlockBeginCallback(
     gva_t addr,
     OCB_t type);
 
+extern DECAF_Handle DECAF_registerExactBlockBeginCallback(
+    DECAF_callback_func_t cb_func,
+    int *cb_cond,
+    gva_t addr);
+
 extern DECAF_Handle DECAF_registerOptimizedBlockEndCallback(
     DECAF_callback_func_t cb_func,
     int *cb_cond,

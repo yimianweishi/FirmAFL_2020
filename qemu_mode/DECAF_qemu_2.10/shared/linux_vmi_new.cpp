@@ -20,10 +20,10 @@
 * 	Author : Abhishek V B
 */
 
+#include "qemu/osdep.h"
 #ifdef __cplusplus
 extern "C" {
 #endif /* __cplusplus */
-#include "qemu/osdep.h"
 #include "cpu.h"
 #include "config.h"
 #include "hw/hw.h" // AWH
@@ -58,6 +58,7 @@ extern "C" {
 #include "DECAF_main.h"
 #include "DECAF_target.h"
 #include "vmi.h"
+#include "vmi_c_wrapper.h"
 #include "linux_vmi_new.h"
 #include "linux_procinfo.h"
 #include "linux_readelf.h"
@@ -82,6 +83,592 @@ static int first = 1;
 
 // current linux profile
 static ProcInfo OFFSET_PROFILE = {"VMI"};
+
+static int qrr_vmi_layout_error(char *error, size_t error_size,
+                                const char *message)
+{
+    if (error && error_size) {
+        snprintf(error, error_size, "%s", message);
+    }
+    return -1;
+}
+
+static bool qrr_vmi_profile_field_valid(target_ulong value)
+{
+    return value != (target_ulong)-1;
+}
+
+extern "C" int VMI_qrr_load_linux_profile_c(
+    const char *procinfo_path, target_ulong init_task_addr,
+    target_ulong proc_exec_connector, char *error, size_t error_size)
+{
+    ProcInfo profile = {"QRR"};
+
+    if (load_proc_info_exact(procinfo_path, init_task_addr, &profile,
+                             error, error_size) != 0) {
+        return -1;
+    }
+    if (profile.init_task_addr != init_task_addr) {
+        return qrr_vmi_layout_error(error, error_size,
+                                    "procinfo-init-task-mismatch");
+    }
+    if (profile.proc_exec_connector != proc_exec_connector) {
+        return qrr_vmi_layout_error(error, error_size,
+                                    "procinfo-exec-symbol-mismatch");
+    }
+    if (!qrr_vmi_profile_field_valid(profile.ts_pid) ||
+        !qrr_vmi_profile_field_valid(profile.ts_mm) ||
+        !qrr_vmi_profile_field_valid(profile.ts_fs) ||
+        !qrr_vmi_profile_field_valid(profile.ts_comm) ||
+        !qrr_vmi_profile_field_valid(profile.mm_pgd) ||
+        !qrr_vmi_profile_field_valid(profile.mm_mmap) ||
+        !qrr_vmi_profile_field_valid(profile.mm_start_brk) ||
+        !qrr_vmi_profile_field_valid(profile.mm_brk) ||
+        !qrr_vmi_profile_field_valid(profile.mm_start_stack) ||
+        !qrr_vmi_profile_field_valid(profile.vma_vm_start) ||
+        !qrr_vmi_profile_field_valid(profile.vma_vm_end) ||
+        !qrr_vmi_profile_field_valid(profile.vma_vm_next) ||
+        !qrr_vmi_profile_field_valid(profile.vma_vm_file) ||
+        !qrr_vmi_profile_field_valid(profile.vma_vm_flags) ||
+        !qrr_vmi_profile_field_valid(profile.vma_vm_pgoff) ||
+        !qrr_vmi_profile_field_valid(profile.file_dentry) ||
+        !qrr_vmi_profile_field_valid(profile.dentry_d_iname) ||
+        !qrr_vmi_profile_field_valid(profile.dentry_d_parent) ||
+        !qrr_vmi_profile_field_valid(profile.dentry_d_name) ||
+        !qrr_vmi_profile_field_valid(profile.qstr_len) ||
+        !qrr_vmi_profile_field_valid(profile.qstr_name) ||
+        !qrr_vmi_profile_field_valid(profile.fs_seq) ||
+        !qrr_vmi_profile_field_valid(profile.fs_root) ||
+        !qrr_vmi_profile_field_valid(profile.fs_pwd) ||
+        !qrr_vmi_profile_field_valid(profile.path_mnt) ||
+        !qrr_vmi_profile_field_valid(profile.path_dentry) ||
+        !qrr_vmi_profile_field_valid(profile.vfsmount_mnt_parent) ||
+        !qrr_vmi_profile_field_valid(profile.vfsmount_mnt_mountpoint) ||
+        !qrr_vmi_profile_field_valid(profile.vfsmount_mnt_root) ||
+        !qrr_vmi_profile_field_valid(profile.ti_task)) {
+        return qrr_vmi_layout_error(error, error_size,
+                                    "procinfo-required-offset-missing");
+    }
+    OFFSET_PROFILE = profile;
+    if (error && error_size) {
+        error[0] = '\0';
+    }
+    fprintf(stderr,
+            "qrr-full: exact procinfo profile=%s init_task=%08" PRIx64
+            " proc_exec_connector=%08" PRIx64 " source=%s\n",
+            OFFSET_PROFILE.strName, (uint64_t)init_task_addr,
+            (uint64_t)proc_exec_connector, procinfo_path);
+    return 0;
+}
+
+extern "C" int VMI_qrr_read_exec_identity_c(
+    CPUState *env, target_ulong task, qrr_vmi_exec_identity_t *identity,
+    char *error, size_t error_size)
+{
+    target_ulong task_pgd;
+    target_ulong physical_pgd;
+    target_ulong pid;
+
+    if (!env || !task || !identity) {
+        return qrr_vmi_layout_error(error, error_size, "invalid-argument");
+    }
+    memset(identity, 0, sizeof(*identity));
+    identity->task = task;
+    if (!OFFSET_PROFILE.init_task_addr) {
+        return qrr_vmi_layout_error(error, error_size,
+                                    "procinfo-profile-not-loaded");
+    }
+    if (DECAF_read_ptr(env, task + OFFSET_PROFILE.ts_mm,
+                       &identity->mm) < 0 || !identity->mm ||
+        DECAF_read_ptr(env, identity->mm + OFFSET_PROFILE.mm_pgd,
+                       &task_pgd) < 0 || !task_pgd ||
+        DECAF_read_ptr(env, task + OFFSET_PROFILE.ts_pid, &pid) < 0 ||
+        DECAF_read_mem(env, task + OFFSET_PROFILE.ts_comm,
+                       sizeof(identity->name), identity->name) < 0) {
+        return qrr_vmi_layout_error(error, error_size,
+                                    "exec-task-read-failed");
+    }
+    if (!memchr(identity->name, '\0', sizeof(identity->name)) ||
+        !identity->name[0] || pid > UINT32_MAX) {
+        return qrr_vmi_layout_error(error, error_size,
+                                    "exec-task-identity-invalid");
+    }
+#ifdef TARGET_MIPS
+    if (task_pgd >= UINT32_C(0x80000000) &&
+        task_pgd < UINT32_C(0xa0000000)) {
+        physical_pgd = task_pgd - UINT32_C(0x80000000);
+    } else if (task_pgd >= UINT32_C(0xa0000000) &&
+               task_pgd < UINT32_C(0xc0000000)) {
+        physical_pgd = task_pgd - UINT32_C(0xa0000000);
+    } else {
+        return qrr_vmi_layout_error(error, error_size,
+                                    "exec-task-pgd-not-direct-mapped");
+    }
+#else
+    physical_pgd = DECAF_get_phys_addr(env, task_pgd);
+#endif
+    identity->pgd = physical_pgd;
+    identity->pid = (uint32_t)pid;
+    if (error && error_size) {
+        error[0] = '\0';
+    }
+    return 0;
+}
+
+extern "C" int VMI_qrr_task_from_thread_info_c(
+    CPUState *env, target_ulong thread_info, target_ulong *task,
+    char *error, size_t error_size)
+{
+    if (!env || !thread_info || !task) {
+        return qrr_vmi_layout_error(error, error_size, "invalid-argument");
+    }
+    if (!OFFSET_PROFILE.init_task_addr) {
+        return qrr_vmi_layout_error(error, error_size,
+                                    "procinfo-profile-not-loaded");
+    }
+    if (DECAF_read_ptr(env, thread_info + OFFSET_PROFILE.ti_task,
+                       task) < 0 || !*task) {
+        return qrr_vmi_layout_error(error, error_size,
+                                    "thread-info-task-read-failed");
+    }
+    if (error && error_size) {
+        error[0] = '\0';
+    }
+    return 0;
+}
+
+#define QRR_VMI_CWD_MAX_COMPONENTS 512
+#define QRR_VMI_NAME_MAX 255
+
+typedef struct _qrr_vmi_path_pair
+{
+    target_ulong mnt;
+    target_ulong dentry;
+} qrr_vmi_path_pair_t;
+
+static int qrr_vmi_read_path_pair(CPUState *env, target_ulong address,
+                                  qrr_vmi_path_pair_t *path,
+                                  char *error, size_t error_size)
+{
+    if (DECAF_read_ptr(env, address + OFFSET_PROFILE.path_mnt,
+                       &path->mnt) < 0 || !path->mnt) {
+        if (error && error_size) {
+            snprintf(error, error_size,
+                     "cwd-path-mnt-read-failed path=%08" PRIx64,
+                     (uint64_t)address);
+        }
+        return -1;
+    }
+    if (DECAF_read_ptr(env, address + OFFSET_PROFILE.path_dentry,
+                       &path->dentry) < 0 || !path->dentry) {
+        if (error && error_size) {
+            snprintf(error, error_size,
+                     "cwd-path-dentry-read-failed path=%08" PRIx64
+                     " mnt=%08" PRIx64,
+                     (uint64_t)address, (uint64_t)path->mnt);
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static int qrr_vmi_build_cwd(CPUState *env,
+                             const qrr_vmi_path_pair_t *root,
+                             const qrr_vmi_path_pair_t *pwd,
+                             char *cwd, size_t cwd_size,
+                             char *error, size_t error_size)
+{
+    qrr_vmi_path_pair_t current = *pwd;
+    qrr_vmi_path_pair_t visited[QRR_VMI_CWD_MAX_COMPONENTS];
+    char reversed[QRR_VMI_CWD_SIZE];
+    size_t position = sizeof(reversed) - 1;
+    size_t count = 0;
+
+    if (!cwd || cwd_size < 2 || cwd_size > sizeof(reversed)) {
+        return qrr_vmi_layout_error(error, error_size,
+                                    "cwd-buffer-invalid");
+    }
+    reversed[position] = '\0';
+    while (current.mnt != root->mnt || current.dentry != root->dentry) {
+        target_ulong mount_root;
+        size_t index;
+
+        if (count == QRR_VMI_CWD_MAX_COMPONENTS) {
+            return qrr_vmi_layout_error(error, error_size,
+                                        "cwd-component-limit");
+        }
+        for (index = 0; index < count; index++) {
+            if (visited[index].mnt == current.mnt &&
+                visited[index].dentry == current.dentry) {
+                return qrr_vmi_layout_error(error, error_size,
+                                            "cwd-path-cycle");
+            }
+        }
+        visited[count++] = current;
+        if (DECAF_read_ptr(env,
+                           current.mnt + OFFSET_PROFILE.vfsmount_mnt_root,
+                           &mount_root) < 0 || !mount_root) {
+            if (error && error_size) {
+                snprintf(error, error_size,
+                         "cwd-mount-root-read-failed mnt=%08" PRIx64,
+                         (uint64_t)current.mnt);
+            }
+            return -1;
+        }
+        if (current.dentry == mount_root) {
+            target_ulong parent_mnt;
+            target_ulong mountpoint;
+
+            if (current.mnt == root->mnt) {
+                return qrr_vmi_layout_error(error, error_size,
+                                            "cwd-outside-process-root");
+            }
+            if (DECAF_read_ptr(
+                    env, current.mnt + OFFSET_PROFILE.vfsmount_mnt_parent,
+                    &parent_mnt) < 0 || !parent_mnt) {
+                if (error && error_size) {
+                    snprintf(error, error_size,
+                             "cwd-mount-parent-read-failed mnt=%08" PRIx64,
+                             (uint64_t)current.mnt);
+                }
+                return -1;
+            }
+            if (DECAF_read_ptr(
+                    env,
+                    current.mnt + OFFSET_PROFILE.vfsmount_mnt_mountpoint,
+                    &mountpoint) < 0 || !mountpoint) {
+                if (error && error_size) {
+                    snprintf(error, error_size,
+                             "cwd-mountpoint-read-failed mnt=%08" PRIx64,
+                             (uint64_t)current.mnt);
+                }
+                return -1;
+            }
+            if (parent_mnt == current.mnt) {
+                if (error && error_size) {
+                    snprintf(error, error_size,
+                             "cwd-mount-parent-self mnt=%08" PRIx64,
+                             (uint64_t)current.mnt);
+                }
+                return -1;
+            }
+            current.mnt = parent_mnt;
+            current.dentry = mountpoint;
+            continue;
+        }
+        {
+            target_ulong parent;
+            target_ulong name_pointer;
+            target_ulong name_length;
+            unsigned char name[QRR_VMI_NAME_MAX];
+
+            if (DECAF_read_ptr(
+                    env, current.dentry + OFFSET_PROFILE.dentry_d_parent,
+                    &parent) < 0 || !parent) {
+                if (error && error_size) {
+                    snprintf(error, error_size,
+                             "cwd-dentry-parent-read-failed dentry=%08"
+                             PRIx64,
+                             (uint64_t)current.dentry);
+                }
+                return -1;
+            }
+            if (parent == current.dentry) {
+                if (error && error_size) {
+                    snprintf(error, error_size,
+                             "cwd-dentry-parent-self dentry=%08" PRIx64,
+                             (uint64_t)current.dentry);
+                }
+                return -1;
+            }
+            if (DECAF_read_ptr(
+                    env,
+                    current.dentry + OFFSET_PROFILE.dentry_d_name +
+                        OFFSET_PROFILE.qstr_len,
+                    &name_length) < 0) {
+                if (error && error_size) {
+                    snprintf(error, error_size,
+                             "cwd-dentry-name-length-read-failed dentry="
+                             "%08" PRIx64,
+                             (uint64_t)current.dentry);
+                }
+                return -1;
+            }
+            if (!name_length || name_length > sizeof(name)) {
+                if (error && error_size) {
+                    snprintf(error, error_size,
+                             "cwd-dentry-name-length-invalid dentry=%08"
+                             PRIx64 " length=%" PRIu64,
+                             (uint64_t)current.dentry,
+                             (uint64_t)name_length);
+                }
+                return -1;
+            }
+            if (DECAF_read_ptr(
+                    env,
+                    current.dentry + OFFSET_PROFILE.dentry_d_name +
+                        OFFSET_PROFILE.qstr_name,
+                    &name_pointer) < 0 || !name_pointer) {
+                if (error && error_size) {
+                    snprintf(error, error_size,
+                             "cwd-dentry-name-pointer-read-failed dentry="
+                             "%08" PRIx64,
+                             (uint64_t)current.dentry);
+                }
+                return -1;
+            }
+            if (DECAF_read_mem(env, name_pointer, name_length, name) < 0) {
+                if (error && error_size) {
+                    snprintf(error, error_size,
+                             "cwd-dentry-name-read-failed dentry=%08"
+                             PRIx64 " name=%08" PRIx64 " length=%" PRIu64,
+                             (uint64_t)current.dentry,
+                             (uint64_t)name_pointer,
+                             (uint64_t)name_length);
+                }
+                return -1;
+            }
+            if (memchr(name, '\0', name_length) ||
+                memchr(name, '/', name_length)) {
+                return qrr_vmi_layout_error(error, error_size,
+                                            "cwd-component-invalid");
+            }
+            if (position < name_length + 1) {
+                return qrr_vmi_layout_error(error, error_size,
+                                            "cwd-path-too-long");
+            }
+            position -= name_length;
+            memcpy(reversed + position, name, name_length);
+            reversed[--position] = '/';
+            current.dentry = parent;
+        }
+    }
+    if (position == sizeof(reversed) - 1) {
+        reversed[--position] = '/';
+    }
+    if (sizeof(reversed) - position > cwd_size) {
+        return qrr_vmi_layout_error(error, error_size,
+                                    "cwd-output-too-small");
+    }
+    memcpy(cwd, reversed + position, sizeof(reversed) - position);
+    return 0;
+}
+
+extern "C" int VMI_qrr_read_exec_cwd_c(
+    CPUState *env, target_ulong task, char *cwd, size_t cwd_size,
+    char *error, size_t error_size)
+{
+    target_ulong fs;
+    unsigned int attempt;
+
+    if (!env || !task || !cwd || cwd_size < 2) {
+        return qrr_vmi_layout_error(error, error_size, "invalid-argument");
+    }
+    if (!OFFSET_PROFILE.init_task_addr) {
+        return qrr_vmi_layout_error(error, error_size,
+                                    "procinfo-profile-not-loaded");
+    }
+    if (DECAF_read_ptr(env, task + OFFSET_PROFILE.ts_fs, &fs) < 0 || !fs) {
+        if (error && error_size) {
+            snprintf(error, error_size,
+                     "task-fs-read-failed task=%08" PRIx64
+                     " field=%08" PRIx64,
+                     (uint64_t)task,
+                     (uint64_t)(task + OFFSET_PROFILE.ts_fs));
+        }
+        return -1;
+    }
+    for (attempt = 0; attempt < 4; attempt++) {
+        target_ulong sequence_before;
+        target_ulong sequence_after;
+        qrr_vmi_path_pair_t root;
+        qrr_vmi_path_pair_t pwd;
+        char captured[QRR_VMI_CWD_SIZE];
+        char walk_error[128] = { 0 };
+        int walk_result = -1;
+
+        if (DECAF_read_ptr(env, fs + OFFSET_PROFILE.fs_seq,
+                           &sequence_before) < 0) {
+            return qrr_vmi_layout_error(error, error_size,
+                                        "cwd-sequence-read-failed");
+        }
+        if (sequence_before & 1) {
+            continue;
+        }
+        if (qrr_vmi_read_path_pair(env, fs + OFFSET_PROFILE.fs_root,
+                                   &root, walk_error,
+                                   sizeof(walk_error)) == 0 &&
+            qrr_vmi_read_path_pair(env, fs + OFFSET_PROFILE.fs_pwd,
+                                   &pwd, walk_error,
+                                   sizeof(walk_error)) == 0) {
+            walk_result = qrr_vmi_build_cwd(
+                env, &root, &pwd, captured, sizeof(captured), walk_error,
+                sizeof(walk_error));
+        }
+        if (DECAF_read_ptr(env, fs + OFFSET_PROFILE.fs_seq,
+                           &sequence_after) < 0) {
+            return qrr_vmi_layout_error(error, error_size,
+                                        "cwd-sequence-read-failed");
+        }
+        if (sequence_before != sequence_after || (sequence_after & 1)) {
+            continue;
+        }
+        if (walk_result != 0) {
+            if (error && error_size) {
+                snprintf(error, error_size,
+                         "cwd-walk-failed fs=%08" PRIx64
+                         " root=%08" PRIx64 ":%08" PRIx64
+                         " pwd=%08" PRIx64 ":%08" PRIx64 " cause=%s",
+                         (uint64_t)fs, (uint64_t)root.mnt,
+                         (uint64_t)root.dentry, (uint64_t)pwd.mnt,
+                         (uint64_t)pwd.dentry,
+                         walk_error[0] ? walk_error : "unknown");
+            }
+            return -1;
+        }
+        if (strlen(captured) + 1 > cwd_size) {
+            return qrr_vmi_layout_error(error, error_size,
+                                        "cwd-output-too-small");
+        }
+        memcpy(cwd, captured, strlen(captured) + 1);
+        if (error && error_size) {
+            error[0] = '\0';
+        }
+        return 0;
+    }
+    return qrr_vmi_layout_error(error, error_size, "cwd-sequence-unstable");
+}
+
+static int qrr_vmi_read_linux_layout_task(CPUState *env, target_ulong task,
+                                          qrr_vmi_layout_t *layout,
+                                          char *error, size_t error_size)
+{
+    target_ulong mm;
+    target_ulong vma;
+    target_ulong first_vma;
+    size_t count = 0;
+
+    if (!env || !layout) {
+        return qrr_vmi_layout_error(error, error_size, "invalid-argument");
+    }
+    memset(layout, 0, sizeof(*layout));
+    if (!OFFSET_PROFILE.init_task_addr) {
+        return qrr_vmi_layout_error(error, error_size,
+                                    "procinfo-profile-not-loaded");
+    }
+    if (!task) {
+        return qrr_vmi_layout_error(error, error_size,
+                                    "process-task-struct-not-found");
+    }
+    if (DECAF_read_ptr(env, task + OFFSET_PROFILE.ts_mm,
+                       &mm) < 0 || !mm) {
+        return qrr_vmi_layout_error(error, error_size,
+                                    "task-mm-read-failed");
+    }
+    if (DECAF_read_ptr(env, mm + OFFSET_PROFILE.mm_start_brk,
+                       &layout->start_brk) < 0 ||
+        DECAF_read_ptr(env, mm + OFFSET_PROFILE.mm_brk,
+                       &layout->brk) < 0 ||
+        DECAF_read_ptr(env, mm + OFFSET_PROFILE.mm_start_stack,
+                       &layout->start_stack) < 0 ||
+        DECAF_read_ptr(env, mm + OFFSET_PROFILE.mm_mmap, &vma) < 0) {
+        return qrr_vmi_layout_error(error, error_size,
+                                    "mm-layout-read-failed");
+    }
+    if (!layout->start_brk || layout->brk < layout->start_brk ||
+        !layout->start_stack) {
+        return qrr_vmi_layout_error(error, error_size,
+                                    "mm-layout-invalid");
+    }
+    first_vma = vma;
+    while (vma) {
+        qrr_vmi_vma_t *out;
+        target_ulong next;
+
+        if (count == QRR_VMI_MAX_VMAS) {
+            return qrr_vmi_layout_error(error, error_size,
+                                        "vma-limit-exceeded");
+        }
+        out = &layout->vmas[count];
+        if (DECAF_read_ptr(env, vma + OFFSET_PROFILE.vma_vm_start,
+                           &out->start) < 0 ||
+            DECAF_read_ptr(env, vma + OFFSET_PROFILE.vma_vm_end,
+                           &out->end) < 0 ||
+            DECAF_read_ptr(env, vma + OFFSET_PROFILE.vma_vm_flags,
+                           &out->flags) < 0 ||
+            DECAF_read_ptr(env, vma + OFFSET_PROFILE.vma_vm_pgoff,
+                           &out->pgoff) < 0 ||
+            DECAF_read_ptr(env, vma + OFFSET_PROFILE.vma_vm_file,
+                           &out->file) < 0) {
+            return qrr_vmi_layout_error(error, error_size,
+                                        "vma-field-read-failed");
+        }
+        if (!out->start || out->end <= out->start) {
+            return qrr_vmi_layout_error(error, error_size,
+                                        "vma-range-invalid");
+        }
+        if (out->file) {
+            target_ulong dentry;
+
+            if (DECAF_read_ptr(env,
+                               out->file + OFFSET_PROFILE.file_dentry,
+                               &dentry) < 0 || !dentry ||
+                DECAF_read_mem(env,
+                               dentry + OFFSET_PROFILE.dentry_d_iname,
+                               QRR_VMI_FILE_NAME_SIZE,
+                               out->file_name) < 0) {
+                return qrr_vmi_layout_error(error, error_size,
+                                            "vma-file-name-read-failed");
+            }
+            out->file_name[QRR_VMI_FILE_NAME_SIZE - 1] = '\0';
+            if (!out->file_name[0]) {
+                return qrr_vmi_layout_error(error, error_size,
+                                            "vma-file-name-empty");
+            }
+        }
+        count++;
+        if (DECAF_read_ptr(env, vma + OFFSET_PROFILE.vma_vm_next,
+                           &next) < 0) {
+            return qrr_vmi_layout_error(error, error_size,
+                                        "vma-next-read-failed");
+        }
+        if (next == first_vma || next == vma) {
+            return qrr_vmi_layout_error(error, error_size,
+                                        "vma-list-cycle");
+        }
+        vma = next;
+    }
+    if (!count) {
+        return qrr_vmi_layout_error(error, error_size, "vma-list-empty");
+    }
+    layout->vma_count = count;
+    if (error && error_size) {
+        error[0] = '\0';
+    }
+    return 0;
+}
+
+extern "C" int VMI_qrr_read_linux_layout_task_c(
+    CPUState *env, target_ulong task, qrr_vmi_layout_t *layout,
+    char *error, size_t error_size)
+{
+    return qrr_vmi_read_linux_layout_task(env, task, layout,
+                                          error, error_size);
+}
+
+extern "C" int VMI_read_linux_layout_c(CPUState *env, uint32_t cr3,
+                                         qrr_vmi_layout_t *layout,
+                                         char *error, size_t error_size)
+{
+    process *proc = VMI_find_process_by_pgd(cr3);
+
+    if (!proc || !proc->EPROC_base_addr) {
+        return qrr_vmi_layout_error(error, error_size,
+                                    "process-task-struct-not-found");
+    }
+    return qrr_vmi_read_linux_layout_task(env, proc->EPROC_base_addr,
+                                          layout, error, error_size);
+}
 
 
 void print_loaded_modules(CPUState *env)
@@ -704,8 +1291,8 @@ static struct {
 
 
 #if defined(TARGET_MIPS)
-gpa_t mips_get_cur_pgd(CPUState *env){
-
+static void mips_init_pte_info(CPUState *env)
+{
     if (unlikely(linux_pte_info.pgd_current_p == 0)) {
         int i;
         uint32_t lui_ins, lw_ins, srl_ins;
@@ -769,10 +1356,29 @@ gpa_t mips_get_cur_pgd(CPUState *env){
         linux_pte_info.pgd_current_p = address;
         linux_pte_info.softshift = (srl_ins >> 6) & 0x1f;
     }
+}
+
+gpa_t mips_get_cur_pgd(CPUState *env)
+{
+    target_ulong pgd;
+
+    mips_init_pte_info(env);
 
     /* Get pgd_current */
-    //return ldl_phys(env->as, linux_pte_info.pgd_current_p);
-    return ldl_phys(env->as, linux_pte_info.pgd_current_p) - 0x80000000; //zyw
+    pgd = ldl_phys(env->as, linux_pte_info.pgd_current_p);
+    if (pgd >= 0x80000000 && pgd < 0xa0000000) {
+        return pgd - 0x80000000;
+    }
+    if (pgd >= 0xa0000000 && pgd < 0xc0000000) {
+        return pgd - 0xa0000000;
+    }
+    cpu_abort(env, "current PGD not in KSEG0/KSEG1\n");
+}
+
+int mips_get_pte_softshift(CPUState *env)
+{
+    mips_init_pte_info(env);
+    return linux_pte_info.softshift;
 }
 #endif
 

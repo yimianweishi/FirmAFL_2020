@@ -40,6 +40,7 @@ void linux_vmi_init();
 //zyw
 target_ulong mips_get_cur_pid(CPUState *env, char *proc_name);
 target_ulong mips_get_cur_pgd(CPUState *env);
+int mips_get_pte_softshift(CPUState *env);
 target_ulong mips_get_cur_cr3(CPUState *env);
 void traverse_mmap_new(CPUState *env, void *opaque, FILE *fp);
 //
@@ -52,5 +53,4 @@ void traverse_mmap(CPUState * env,void *opaque);
 };
 #endif
 #endif /* RECON_H_ */
-
 

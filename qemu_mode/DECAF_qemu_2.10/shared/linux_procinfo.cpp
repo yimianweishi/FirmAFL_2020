@@ -1660,6 +1660,7 @@ void _load_one_section(const boost::property_tree::ptree &pt, int iSectionNum, P
     FILL_TARGET_ULONG_FIELD(ts_thread_group );
     FILL_TARGET_ULONG_FIELD(ts_real_parent  );
     FILL_TARGET_ULONG_FIELD(ts_mm           );
+    FILL_TARGET_ULONG_FIELD(ts_fs           );
     FILL_TARGET_ULONG_FIELD(ts_stack        );
     FILL_TARGET_ULONG_FIELD(ts_real_cred    );
     FILL_TARGET_ULONG_FIELD(ts_cred         );
@@ -1692,6 +1693,16 @@ void _load_one_section(const boost::property_tree::ptree &pt, int iSectionNum, P
     FILL_TARGET_ULONG_FIELD(dentry_d_name   );
     FILL_TARGET_ULONG_FIELD(dentry_d_iname  );
     FILL_TARGET_ULONG_FIELD(dentry_d_parent );
+    FILL_TARGET_ULONG_FIELD(qstr_len         );
+    FILL_TARGET_ULONG_FIELD(qstr_name        );
+    FILL_TARGET_ULONG_FIELD(fs_seq           );
+    FILL_TARGET_ULONG_FIELD(fs_root          );
+    FILL_TARGET_ULONG_FIELD(fs_pwd           );
+    FILL_TARGET_ULONG_FIELD(path_mnt         );
+    FILL_TARGET_ULONG_FIELD(path_dentry      );
+    FILL_TARGET_ULONG_FIELD(vfsmount_mnt_parent);
+    FILL_TARGET_ULONG_FIELD(vfsmount_mnt_mountpoint);
+    FILL_TARGET_ULONG_FIELD(vfsmount_mnt_root);
     FILL_TARGET_ULONG_FIELD(ti_task         );
 	FILL_TARGET_ULONG_FIELD(inode_ino);
   FILL_TARGET_ULONG_FIELD(kernel_fatal_signal);
@@ -1706,6 +1717,57 @@ void _load_one_section(const boost::property_tree::ptree &pt, int iSectionNum, P
 #ifdef TARGET_MIPS
     FILL_TARGET_ULONG_FIELD(mips_pgd_current);
 #endif
+}
+
+/* Load the one procinfo section whose init_task address exactly matches the
+ * symbol from the configured vmlinux.  QRR uses this entry point so target
+ * discovery never depends on scanning guest memory or maintaining VMI's
+ * global process table. */
+int load_proc_info_exact(const char *path, target_ulong init_task_addr,
+                         ProcInfo *pi, char *error, size_t error_size)
+{
+    boost::property_tree::ptree pt;
+    int total;
+    int match = 0;
+    int matches = 0;
+
+    if (!path || !path[0] || !init_task_addr || !pi) {
+        if (error && error_size) {
+            snprintf(error, error_size, "invalid-argument");
+        }
+        return -1;
+    }
+    try {
+        boost::property_tree::ini_parser::read_ini(path, pt);
+        total = pt.get<int>("info.total");
+        for (int i = 1; i <= total; i++) {
+            string section = boost::lexical_cast<string>(i);
+            target_ulong candidate = pt.get<target_ulong>(
+                section + ".init_task_addr");
+
+            if (candidate == init_task_addr) {
+                match = i;
+                matches++;
+            }
+        }
+        if (matches != 1) {
+            if (error && error_size) {
+                snprintf(error, error_size,
+                         matches ? "duplicate-init-task-section" :
+                                   "init-task-section-not-found");
+            }
+            return -1;
+        }
+        memset(pi, 0, sizeof(*pi));
+        _load_one_section(pt, match, *pi);
+    } catch (const std::exception &exception) {
+        if (error && error_size) {
+            snprintf(error, error_size, "procinfo-parse-failed: %.80s",
+                     exception.what());
+        }
+        return -1;
+    }
+    return 0;
 }
 
 // find the corresponding section for the current os and return the section number

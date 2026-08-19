@@ -38,8 +38,8 @@ public:
 	uint16_t major;
 	uint16_t minor;
 	bool	symbols_extracted;
-	unordered_map < uint32_t, string> function_map_offset;
-	unordered_map < string, uint32_t> function_map_name;
+	std::tr1::unordered_map < uint32_t, string> function_map_offset;
+	std::tr1::unordered_map < string, uint32_t> function_map_name;
 	unsigned int inode_number;
 
 	module() : symbols_extracted(false), inode_number(0)
@@ -57,10 +57,10 @@ public:
     char name[VMI_MAX_MODULE_PROCESS_NAME_LEN];
     bool modules_extracted;
     //map base address to module pointer
-    unordered_map < uint32_t,module * >module_list;
+    std::tr1::unordered_map < uint32_t,module * >module_list;
     //a set of virtual pages that have been resolved with module information
-    unordered_set< uint32_t > resolved_pages;
-    unordered_map< uint32_t, int > unresolved_pages;
+    std::tr1::unordered_set< uint32_t > resolved_pages;
+    std::tr1::unordered_map< uint32_t, int > unresolved_pages;
 };
 
 
@@ -77,9 +77,9 @@ typedef struct os_handle_c{
 
 extern target_ulong VMI_guest_kernel_base;
 
-extern unordered_map < uint32_t, process * >process_map;
-extern unordered_map < uint32_t, process * >process_pid_map;
-extern unordered_map < string, module * >module_name;
+extern std::tr1::unordered_map < uint32_t, process * >process_map;
+extern std::tr1::unordered_map < uint32_t, process * >process_pid_map;
+extern std::tr1::unordered_map < string, module * >module_name;
 
 /* Kernel module VMI information related functions */
 

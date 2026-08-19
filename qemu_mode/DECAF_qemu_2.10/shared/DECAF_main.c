@@ -675,7 +675,16 @@ void DECAF_init(void) {
 #ifndef CONFIG_VMI_ENABLE
 	procmod_init();
 #else
-	VMI_init();
+	/* QRR resolves proc_exec_connector from the configured vmlinux and
+	 * registers one optimized callback itself.  Starting VMI here would add
+	 * the global OS-probe callback, process table, exec/fork traversal and
+	 * exit callback that target-PGD collection deliberately does not use. */
+	if (!getenv("QRR_FULL_TCG_QRR")) {
+		VMI_init();
+	} else {
+		fprintf(stderr,
+		        "qrr-full: skipped global VMI process tracking\n");
+	}
 	//linux_vmi_init(); //zyw
 #endif
 }
@@ -802,6 +811,5 @@ static void convert_endian_4b(uint32_t *data)
          | ((*data & 0x0000ff00) <<  8)
          | ((*data & 0x000000ff) << 24);
 }
-
 
 

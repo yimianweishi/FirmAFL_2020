@@ -22,6 +22,7 @@ typedef struct _ProcInfo
 	target_ulong ts_thread_group;
 	target_ulong ts_real_parent;
 	target_ulong ts_mm;
+	target_ulong ts_fs;
 	union
 	{
 		target_ulong ts_stack;
@@ -56,6 +57,16 @@ typedef struct _ProcInfo
 	target_ulong dentry_d_name;
 	target_ulong dentry_d_iname;
 	target_ulong dentry_d_parent;
+	target_ulong qstr_len;
+	target_ulong qstr_name;
+	target_ulong fs_seq;
+	target_ulong fs_root;
+	target_ulong fs_pwd;
+	target_ulong path_mnt;
+	target_ulong path_dentry;
+	target_ulong vfsmount_mnt_parent;
+	target_ulong vfsmount_mnt_mountpoint;
+	target_ulong vfsmount_mnt_root;
 	target_ulong ti_task;
 	target_ulong file_inode;
 	target_ulong inode_ino;
@@ -84,10 +95,11 @@ typedef struct _ProcInfo
 gva_t findTaskStructFromThreadInfo(CPUState * env, gva_t threadinfo, ProcInfo* pPI, int bDoubleCheck); //zyw
 int printProcInfo(ProcInfo* pPI);
 int load_proc_info(CPUState * env, gva_t threadinfo, ProcInfo &pi);
+int load_proc_info_exact(const char *path, target_ulong init_task_addr,
+                         ProcInfo *pi, char *error, size_t error_size);
 void load_library_info(const char *strName);
 
 #ifdef __cplusplus
 };
 #endif
 #endif /* RECON_H_ */
-
