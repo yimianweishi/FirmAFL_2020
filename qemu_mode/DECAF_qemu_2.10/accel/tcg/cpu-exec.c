@@ -1251,7 +1251,7 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
     }
 #endif /* DEBUG_DISAS */
 
-    qrr_full_note_tb(cpu, itb->pc);
+    qrr_full_note_tb(cpu, itb);
 
     cpu->can_do_io = !use_icount;
 

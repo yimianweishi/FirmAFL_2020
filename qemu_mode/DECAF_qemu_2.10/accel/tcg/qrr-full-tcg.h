@@ -30,9 +30,9 @@ typedef struct QrrFullOpenHow {
 #define QRR_FULL_EXEC_COLUMNS \
     "sequence\tpgd\tentry_pc\tsyscall_nr\targc\tfilename_hex\targv_nul_hex\tcwd_hex\tstatus\treason"
 #define QRR_FULL_SIGNAL_MAGIC \
-    "QEMU_RESULT_SIGNAL\t1\tqemu-result-signal-v1"
+    "QEMU_RESULT_SIGNAL\t2\tqemu-result-signal-v2"
 #define QRR_FULL_SIGNAL_COLUMNS \
-    "process_token\tevent_sequence\tanchor_kind\tsyscall_key\tsyscall_sequence\tsyscall_nr\tpath_hash\tdep_hash\tinterrupted_pc\tinterrupted_sp\tsigno\tsi_code\tsi_errno\tsi_pid\tsi_uid\tsi_status\tsi_value\tfault_addr"
+    "process_token\tevent_sequence\tanchor_kind\tsyscall_key\tsyscall_sequence\tsyscall_nr\tpath_hash\tdep_hash\tedge_from_pc\tedge_to_pc\tedge_occurrence\tinterrupted_pc\tinterrupted_sp\tsigno\tsi_code\tsi_errno\tsi_pid\tsi_uid\tsi_status\tsi_value\tfault_addr"
 #define QRR_FULL_LAYOUT_MAGIC \
     "QEMU_RESULT_LAYOUT\t1\tqemu-result-layout-v3"
 #define QRR_FULL_LAYOUT_COLUMNS \
@@ -120,6 +120,8 @@ typedef struct QrrFullPathState {
     unsigned int path_tail_next;
     uint64_t previous_tb;
     bool have_previous_tb;
+    target_ulong previous_user_edge_pc;
+    bool have_previous_user_edge_pc;
     uint64_t syscall_site_tail[QRR_FULL_PATH_TAIL_LENGTH];
     unsigned int syscall_site_tail_count;
     unsigned int syscall_site_tail_next;
@@ -129,6 +131,14 @@ typedef struct QrrFullPathState {
     uint64_t mmap_event_seq;
     struct QrrFullPathState *next;
 } QrrFullPathState;
+
+typedef struct QrrFullUserEdgeCount {
+    target_ulong pgd;
+    target_ulong from_pc;
+    target_ulong to_pc;
+    uint64_t occurrence;
+    struct QrrFullUserEdgeCount *next;
+} QrrFullUserEdgeCount;
 
 typedef struct QrrFullTargetPgd {
     target_ulong pgd;
@@ -306,6 +316,7 @@ static QrrFullSemaphoreLockCall *qrr_full_semaphore_lock_calls;
 static QrrFullLayoutCaptured *qrr_full_layout_captured;
 static QrrFullMmapMapping *qrr_full_mmap_mappings;
 static QrrFullPageFaultCall *qrr_full_page_fault_calls;
+static QrrFullUserEdgeCount *qrr_full_user_edge_counts;
 static target_ulong qrr_full_last_kernel_thread_info;
 static bool qrr_full_have_last_kernel_thread_info;
 static const char *qrr_full_rootfs_path;
@@ -1070,11 +1081,113 @@ static uint64_t qrr_full_child_process_token(uint64_t parent_token,
     return qrr_full_hash_mix_u64(token, fork_ordinal);
 }
 
+static void qrr_full_user_edge_remove_all(target_ulong pgd)
+{
+    QrrFullUserEdgeCount **link = &qrr_full_user_edge_counts;
+
+    while (*link) {
+        QrrFullUserEdgeCount *entry = *link;
+
+        if (entry->pgd == pgd) {
+            *link = entry->next;
+            free(entry);
+            continue;
+        }
+        link = &entry->next;
+    }
+}
+
+static QrrFullUserEdgeCount *qrr_full_user_edge_find(target_ulong pgd,
+                                                      target_ulong from_pc,
+                                                      target_ulong to_pc)
+{
+    QrrFullUserEdgeCount *entry;
+
+    for (entry = qrr_full_user_edge_counts; entry; entry = entry->next) {
+        if (entry->pgd == pgd && entry->from_pc == from_pc &&
+            entry->to_pc == to_pc) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+static uint64_t qrr_full_user_edge_next_occurrence(target_ulong pgd,
+                                                    target_ulong from_pc,
+                                                    target_ulong to_pc)
+{
+    QrrFullUserEdgeCount *entry = qrr_full_user_edge_find(
+        pgd, from_pc, to_pc);
+
+    if (entry && entry->occurrence == UINT64_MAX) {
+        fprintf(stderr,
+                "qrr-full: user edge occurrence overflow pgd=" TARGET_FMT_lx
+                " from=" TARGET_FMT_lx " to=" TARGET_FMT_lx "\n",
+                pgd, from_pc, to_pc);
+        exit(2);
+    }
+    return entry ? entry->occurrence + 1 : 1;
+}
+
+static uint64_t qrr_full_user_edge_note(target_ulong pgd,
+                                        target_ulong from_pc,
+                                        target_ulong to_pc)
+{
+    QrrFullUserEdgeCount *entry = qrr_full_user_edge_find(
+        pgd, from_pc, to_pc);
+
+    if (!entry) {
+        entry = calloc(1, sizeof(*entry));
+        if (!entry) {
+            fprintf(stderr, "qrr-full: cannot allocate user edge counter\n");
+            exit(2);
+        }
+        entry->pgd = pgd;
+        entry->from_pc = from_pc;
+        entry->to_pc = to_pc;
+        entry->next = qrr_full_user_edge_counts;
+        qrr_full_user_edge_counts = entry;
+    }
+    if (entry->occurrence == UINT64_MAX) {
+        fprintf(stderr,
+                "qrr-full: user edge occurrence overflow pgd=" TARGET_FMT_lx
+                " from=" TARGET_FMT_lx " to=" TARGET_FMT_lx "\n",
+                pgd, from_pc, to_pc);
+        exit(2);
+    }
+    return ++entry->occurrence;
+}
+
+static void qrr_full_user_edge_clone(target_ulong source_pgd,
+                                     target_ulong target_pgd)
+{
+    QrrFullUserEdgeCount *entry;
+
+    qrr_full_user_edge_remove_all(target_pgd);
+    for (entry = qrr_full_user_edge_counts; entry; entry = entry->next) {
+        QrrFullUserEdgeCount *copy;
+
+        if (entry->pgd != source_pgd) {
+            continue;
+        }
+        copy = malloc(sizeof(*copy));
+        if (!copy) {
+            fprintf(stderr, "qrr-full: cannot clone user edge counter\n");
+            exit(2);
+        }
+        *copy = *entry;
+        copy->pgd = target_pgd;
+        copy->next = qrr_full_user_edge_counts;
+        qrr_full_user_edge_counts = copy;
+    }
+}
+
 static void qrr_full_reset_path_context(target_ulong pgd,
                                         uint64_t process_token)
 {
     QrrFullPathState *state;
 
+    qrr_full_user_edge_remove_all(pgd);
     for (state = qrr_full_paths; state; state = state->next) {
         if (state->pgd == pgd) {
             QrrFullPathState *next = state->next;
@@ -1430,6 +1543,7 @@ static void qrr_full_unbind_process(target_ulong pgd, const char *process_name)
         }
     }
     qrr_full_fd_remove_all(pgd);
+    qrr_full_user_edge_remove_all(pgd);
     if (pgd == qrr_full_selected_pgd) {
         qrr_full_target_active = false;
     }
@@ -1616,11 +1730,12 @@ static void qrr_full_bind_target_exec_transition(CPUState *cpu,
 #endif
 }
 
-static void qrr_full_note_tb(CPUState *cpu, target_ulong pc)
+static void qrr_full_note_tb(CPUState *cpu, TranslationBlock *itb)
 {
     QrrFullPathState *state;
     target_ulong pgd;
     uint64_t tb;
+    target_ulong pc = itb->pc;
 
     if (!qrr_full_init()) {
         return;
@@ -1656,6 +1771,13 @@ static void qrr_full_note_tb(CPUState *cpu, target_ulong pc)
                                     ((CPUArchState *)cpu->env_ptr)->
                                         active_tc.gpr[29]);
 #endif
+    qrr_full_user_edge_note(
+        pgd,
+        state->have_previous_user_edge_pc ? state->previous_user_edge_pc : 0,
+        pc);
+    state->previous_user_edge_pc =
+        itb->size >= 4 ? pc + itb->size - 4 : pc;
+    state->have_previous_user_edge_pc = true;
     tb = (uint64_t)pc >> 4;
     if (state->have_previous_tb) {
         state->path_tail[state->path_tail_next] = tb - state->previous_tb;
@@ -1710,6 +1832,9 @@ static void qrr_full_advance_context(QrrFullPathState *state, int syscall_nr,
     state->path_tail_count = 0;
     state->path_tail_next = 0;
     state->have_previous_tb = false;
+    state->previous_user_edge_pc = 0;
+    state->have_previous_user_edge_pc = false;
+    qrr_full_user_edge_remove_all(state->pgd);
 }
 
 static void qrr_full_current_signal_context(const QrrFullPathState *state,
@@ -3646,6 +3771,7 @@ static void qrr_full_clone_process_state(target_ulong source_pgd,
         memcpy(target_state, source_state, sizeof(*target_state));
         target_state->pgd = target_pgd;
         target_state->next = next;
+        qrr_full_user_edge_clone(source_pgd, target_pgd);
     }
     for (fd_path = qrr_full_fd_paths; fd_path; fd_path = fd_path->next) {
         if (fd_path->pgd == source_pgd) {
@@ -3806,6 +3932,7 @@ static void qrr_full_inherit_target_fork(CPUState *cpu, target_ulong pgd,
             target_state->process_token = pending->child_process_token;
             target_state->next_fork_ordinal = 0;
             target_state->next = next;
+            qrr_full_user_edge_remove_all(pgd);
         }
     }
     for (fd_path = pending->fd_paths; fd_path; fd_path = fd_path->next) {
@@ -5150,6 +5277,9 @@ static void qrr_full_record_signal_delivery(CPUState *cpu,
     uint64_t syscall_sequence = 0;
     uint64_t path_hash;
     uint64_t dep_hash;
+    target_ulong edge_from_pc = 0;
+    target_ulong edge_to_pc = 0;
+    uint64_t edge_occurrence = 0;
     int syscall_nr = -1;
     const char *anchor_kind = "user";
 
@@ -5208,17 +5338,25 @@ static void qrr_full_record_signal_delivery(CPUState *cpu,
         dep_hash = pending->dep_hash;
     } else {
         qrr_full_current_signal_context(state, &path_hash, &dep_hash);
+        syscall_sequence = state->syscall_seq;
+        edge_from_pc = state->have_previous_user_edge_pc ?
+            state->previous_user_edge_pc : 0;
+        edge_to_pc = interrupted_pc;
+        edge_occurrence = qrr_full_user_edge_next_occurrence(
+            call->pgd, edge_from_pc, edge_to_pc);
     }
     state->signal_seq++;
     fprintf(qrr_full_signal_fp,
             "%016" PRIx64 "\t%" PRIu64 "\t%s\t%016" PRIx64
             "\t%" PRIu64 "\t%d\t%016" PRIx64 "\t%016" PRIx64
+            "\t%016" PRIx64 "\t%016" PRIx64 "\t%" PRIu64
             "\t%016" PRIx64 "\t%016" PRIx64
             "\t%d\t%" PRId32 "\t%" PRId32 "\t%" PRIu32
             "\t%" PRIu32 "\t%" PRId32 "\t%016" PRIx64
             "\t%016" PRIx64 "\n",
             state->process_token, state->signal_seq, anchor_kind, key,
             syscall_sequence, syscall_nr, path_hash, dep_hash,
+            (uint64_t)edge_from_pc, (uint64_t)edge_to_pc, edge_occurrence,
             (uint64_t)interrupted_pc, (uint64_t)interrupted_sp, signo,
             (int32_t)info_code, (int32_t)info_errno, info_pid, info_uid,
             (int32_t)info_status, (uint64_t)info_value,
@@ -5231,10 +5369,13 @@ static void qrr_full_record_signal_delivery(CPUState *cpu,
     fprintf(stderr,
             "qrr-full: signal process=%016" PRIx64 " event=%" PRIu64
             " signo=%d anchor=%s syscall_sequence=%" PRIu64
+            " edge=%08" PRIx64 "->%08" PRIx64 "#%" PRIu64
             " interrupted_pc=%08" PRIx32 " interrupted_sp=%08" PRIx32
             "\n",
             state->process_token, state->signal_seq, signo, anchor_kind,
-            syscall_sequence, interrupted_pc, interrupted_sp);
+            syscall_sequence, (uint64_t)edge_from_pc,
+            (uint64_t)edge_to_pc, edge_occurrence,
+            interrupted_pc, interrupted_sp);
 #else
     (void)cpu;
     (void)call;
