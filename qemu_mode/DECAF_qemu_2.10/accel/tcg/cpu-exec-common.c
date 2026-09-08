@@ -25,6 +25,8 @@
 
 bool tcg_allowed;
 
+void qrr_full_tcg_tb_interrupted(CPUState *cpu, bool state_restored);
+
 /* exit the current TB, but without causing any exception to be raised */
 void cpu_loop_exit_noexc(CPUState *cpu)
 {
@@ -66,14 +68,18 @@ void cpu_reloading_memory_map(void)
 
 void cpu_loop_exit(CPUState *cpu)
 {
+    qrr_full_tcg_tb_interrupted(cpu, false);
     siglongjmp(cpu->jmp_env, 1);
 }
 
 void cpu_loop_exit_restore(CPUState *cpu, uintptr_t pc)
 {
+    bool restored = false;
+
     if (pc) {
-        cpu_restore_state(cpu, pc);
+        restored = cpu_restore_state(cpu, pc);
     }
+    qrr_full_tcg_tb_interrupted(cpu, restored);
     siglongjmp(cpu->jmp_env, 1);
 }
 

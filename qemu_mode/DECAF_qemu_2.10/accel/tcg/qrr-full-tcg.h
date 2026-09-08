@@ -30,7 +30,7 @@ typedef struct QrrFullOpenHow {
 #define QRR_FULL_EXEC_COLUMNS \
     "sequence\tpgd\tentry_pc\tsyscall_nr\targc\tfilename_hex\targv_nul_hex\tcwd_hex\tstatus\treason"
 #define QRR_FULL_SIGNAL_MAGIC \
-    "QEMU_RESULT_SIGNAL\t2\tqemu-result-signal-v2"
+    "QEMU_RESULT_SIGNAL\t3\tqemu-result-signal-v3"
 #define QRR_FULL_SIGNAL_COLUMNS \
     "process_token\tevent_sequence\tanchor_kind\tsyscall_key\tsyscall_sequence\tsyscall_nr\tpath_hash\tdep_hash\tedge_from_pc\tedge_to_pc\tedge_occurrence\tinterrupted_pc\tinterrupted_sp\tsigno\tsi_code\tsi_errno\tsi_pid\tsi_uid\tsi_status\tsi_value\tfault_addr"
 #define QRR_FULL_LAYOUT_MAGIC \
@@ -139,6 +139,16 @@ typedef struct QrrFullUserEdgeCount {
     uint64_t occurrence;
     struct QrrFullUserEdgeCount *next;
 } QrrFullUserEdgeCount;
+
+typedef struct QrrFullTbPending {
+    CPUState *cpu;
+    target_ulong pgd;
+    target_ulong tb_pc;
+    uint32_t tb_size;
+    target_ulong edge_from_pc;
+    uint64_t edge_occurrence;
+    struct QrrFullTbPending *next;
+} QrrFullTbPending;
 
 typedef struct QrrFullTargetPgd {
     target_ulong pgd;
@@ -317,6 +327,7 @@ static QrrFullLayoutCaptured *qrr_full_layout_captured;
 static QrrFullMmapMapping *qrr_full_mmap_mappings;
 static QrrFullPageFaultCall *qrr_full_page_fault_calls;
 static QrrFullUserEdgeCount *qrr_full_user_edge_counts;
+static QrrFullTbPending *qrr_full_tb_pending;
 static target_ulong qrr_full_last_kernel_thread_info;
 static bool qrr_full_have_last_kernel_thread_info;
 static const char *qrr_full_rootfs_path;
@@ -756,6 +767,12 @@ static bool qrr_full_load_semaphore_profile(const char *path,
 
 static void qrr_full_close(void)
 {
+    while (qrr_full_tb_pending) {
+        QrrFullTbPending *pending = qrr_full_tb_pending;
+
+        qrr_full_tb_pending = pending->next;
+        free(pending);
+    }
     if (qrr_full_table_fp) {
         fclose(qrr_full_table_fp);
         qrr_full_table_fp = NULL;
@@ -1158,6 +1175,47 @@ static uint64_t qrr_full_user_edge_note(target_ulong pgd,
     return ++entry->occurrence;
 }
 
+static QrrFullTbPending *qrr_full_tb_pending_find(CPUState *cpu)
+{
+    QrrFullTbPending *pending;
+
+    for (pending = qrr_full_tb_pending; pending; pending = pending->next) {
+        if (pending->cpu == cpu) {
+            return pending;
+        }
+    }
+    return NULL;
+}
+
+static void qrr_full_tb_pending_remove(QrrFullTbPending *pending)
+{
+    QrrFullTbPending **link = &qrr_full_tb_pending;
+
+    while (*link && *link != pending) {
+        link = &(*link)->next;
+    }
+    if (*link) {
+        *link = pending->next;
+        free(pending);
+    }
+}
+
+static void qrr_full_tb_pending_remove_pgd(target_ulong pgd)
+{
+    QrrFullTbPending **link = &qrr_full_tb_pending;
+
+    while (*link) {
+        QrrFullTbPending *pending = *link;
+
+        if (pending->pgd == pgd) {
+            *link = pending->next;
+            free(pending);
+            continue;
+        }
+        link = &pending->next;
+    }
+}
+
 static void qrr_full_user_edge_clone(target_ulong source_pgd,
                                      target_ulong target_pgd)
 {
@@ -1188,6 +1246,7 @@ static void qrr_full_reset_path_context(target_ulong pgd,
     QrrFullPathState *state;
 
     qrr_full_user_edge_remove_all(pgd);
+    qrr_full_tb_pending_remove_pgd(pgd);
     for (state = qrr_full_paths; state; state = state->next) {
         if (state->pgd == pgd) {
             QrrFullPathState *next = state->next;
@@ -1544,6 +1603,7 @@ static void qrr_full_unbind_process(target_ulong pgd, const char *process_name)
     }
     qrr_full_fd_remove_all(pgd);
     qrr_full_user_edge_remove_all(pgd);
+    qrr_full_tb_pending_remove_pgd(pgd);
     if (pgd == qrr_full_selected_pgd) {
         qrr_full_target_active = false;
     }
@@ -1730,11 +1790,11 @@ static void qrr_full_bind_target_exec_transition(CPUState *cpu,
 #endif
 }
 
-static void qrr_full_note_tb(CPUState *cpu, TranslationBlock *itb)
+static void qrr_full_tb_before(CPUState *cpu, TranslationBlock *itb)
 {
     QrrFullPathState *state;
+    QrrFullTbPending *pending;
     target_ulong pgd;
-    uint64_t tb;
     target_ulong pc = itb->pc;
 
     if (!qrr_full_init()) {
@@ -1771,14 +1831,75 @@ static void qrr_full_note_tb(CPUState *cpu, TranslationBlock *itb)
                                     ((CPUArchState *)cpu->env_ptr)->
                                         active_tc.gpr[29]);
 #endif
-    qrr_full_user_edge_note(
-        pgd,
-        state->have_previous_user_edge_pc ? state->previous_user_edge_pc : 0,
-        pc);
-    state->previous_user_edge_pc =
-        itb->size >= 4 ? pc + itb->size - 4 : pc;
+    if (qrr_full_tb_pending_find(cpu)) {
+        fprintf(stderr,
+                "qrr-full: pending user TB before next TB cpu=%p pc="
+                TARGET_FMT_lx "\n", (void *)cpu, pc);
+        exit(2);
+    }
+    pending = calloc(1, sizeof(*pending));
+    if (!pending) {
+        fprintf(stderr, "qrr-full: cannot allocate pending user TB\n");
+        exit(2);
+    }
+    pending->cpu = cpu;
+    pending->pgd = pgd;
+    pending->tb_pc = pc;
+    pending->tb_size = itb->size;
+    pending->edge_from_pc = state->have_previous_user_edge_pc ?
+        state->previous_user_edge_pc : 0;
+    pending->edge_occurrence = qrr_full_user_edge_next_occurrence(
+        pgd, pending->edge_from_pc, pc);
+    pending->next = qrr_full_tb_pending;
+    qrr_full_tb_pending = pending;
+}
+
+static void qrr_full_tb_discard(CPUState *cpu, const char *reason)
+{
+    QrrFullTbPending *pending = qrr_full_tb_pending_find(cpu);
+
+    (void)reason;
+    if (!pending) {
+        return;
+    }
+    qrr_full_tb_pending_remove(pending);
+}
+
+static void qrr_full_tb_commit(CPUState *cpu,
+                               target_ulong last_completed_pc,
+                               const char *reason)
+{
+    QrrFullTbPending *pending = qrr_full_tb_pending_find(cpu);
+    QrrFullPathState *state;
+    uint64_t occurrence;
+    uint64_t tb;
+
+    if (!pending) {
+        return;
+    }
+    (void)reason;
+    state = qrr_full_path_state(pending->pgd, false);
+    if (!state || !state->process_token) {
+        fprintf(stderr,
+                "qrr-full: pending user TB lost process state pgd="
+                TARGET_FMT_lx " pc=" TARGET_FMT_lx "\n",
+                pending->pgd, pending->tb_pc);
+        exit(2);
+    }
+    occurrence = qrr_full_user_edge_note(
+        pending->pgd, pending->edge_from_pc, pending->tb_pc);
+    if (occurrence != pending->edge_occurrence) {
+        fprintf(stderr,
+                "qrr-full: pending user edge occurrence changed pgd="
+                TARGET_FMT_lx " edge=" TARGET_FMT_lx "->" TARGET_FMT_lx
+                " expected=%" PRIu64 " actual=%" PRIu64 "\n",
+                pending->pgd, pending->edge_from_pc, pending->tb_pc,
+                pending->edge_occurrence, occurrence);
+        exit(2);
+    }
+    state->previous_user_edge_pc = last_completed_pc;
     state->have_previous_user_edge_pc = true;
-    tb = (uint64_t)pc >> 4;
+    tb = (uint64_t)pending->tb_pc >> 4;
     if (state->have_previous_tb) {
         state->path_tail[state->path_tail_next] = tb - state->previous_tb;
         state->path_tail_next =
@@ -1789,6 +1910,93 @@ static void qrr_full_note_tb(CPUState *cpu, TranslationBlock *itb)
     }
     state->previous_tb = tb;
     state->have_previous_tb = true;
+    qrr_full_tb_pending_remove(pending);
+}
+
+static void qrr_full_tb_after(CPUState *cpu, TranslationBlock *itb,
+                              bool completed)
+{
+    QrrFullTbPending *pending = qrr_full_tb_pending_find(cpu);
+    target_ulong last_completed_pc;
+
+    if (!pending) {
+        return;
+    }
+    if (pending->tb_pc != itb->pc || pending->tb_size != itb->size) {
+        fprintf(stderr,
+                "qrr-full: pending/returned TB identity mismatch"
+                " pending=" TARGET_FMT_lx "/%" PRIu32
+                " returned=" TARGET_FMT_lx "/%u\n",
+                pending->tb_pc, pending->tb_size, itb->pc, itb->size);
+        exit(2);
+    }
+    if (!completed) {
+        qrr_full_tb_discard(cpu, "before-first-instruction");
+        return;
+    }
+#ifdef TARGET_MIPS
+    last_completed_pc = itb->size >= 4 ?
+        itb->pc + itb->size - 4 : itb->pc;
+#else
+    last_completed_pc = itb->pc;
+#endif
+    qrr_full_tb_commit(cpu, last_completed_pc, "complete");
+}
+
+static void qrr_full_tb_interrupted(CPUState *cpu, bool state_restored)
+{
+    QrrFullTbPending *pending = qrr_full_tb_pending_find(cpu);
+
+    if (!pending) {
+        return;
+    }
+    if (!state_restored) {
+        qrr_full_tb_discard(cpu, "unrestored-exit");
+        return;
+    }
+#ifdef TARGET_MIPS
+    {
+        CPUArchState *env = cpu->env_ptr;
+        target_ulong fault_pc = env->active_tc.PC;
+        target_ulong tb_end = pending->tb_pc + pending->tb_size;
+        target_ulong last_completed_pc;
+        unsigned int instruction_size = 4;
+        bool delay_slot = (env->hflags & MIPS_HFLAG_BMASK) != 0;
+
+        if (fault_pc == pending->tb_pc) {
+            qrr_full_tb_discard(
+                cpu, delay_slot ? "first-instruction-delay-slot-exception" :
+                                  "first-instruction-exception");
+            return;
+        }
+        if (fault_pc < pending->tb_pc || fault_pc >= tb_end) {
+            fprintf(stderr,
+                    "qrr-full: exception PC outside pending user TB"
+                    " pgd=" TARGET_FMT_lx " tb=" TARGET_FMT_lx
+                    "-" TARGET_FMT_lx " fault=" TARGET_FMT_lx
+                    " hflags=%08x\n", pending->pgd, pending->tb_pc,
+                    tb_end, fault_pc, env->hflags);
+            exit(2);
+        }
+        if (delay_slot) {
+            instruction_size =
+                (env->hflags & MIPS_HFLAG_B16) ? 2 : 4;
+        } else if (env->hflags & MIPS_HFLAG_M16) {
+            instruction_size = 2;
+        }
+        if (fault_pc < pending->tb_pc + instruction_size) {
+            qrr_full_tb_discard(
+                cpu, "no-completed-instruction-before-exception");
+            return;
+        }
+        last_completed_pc = fault_pc - instruction_size;
+        qrr_full_tb_commit(cpu, last_completed_pc,
+                           delay_slot ? "delay-slot-exception" :
+                                        "mid-tb-exception");
+    }
+#else
+    qrr_full_tb_discard(cpu, "unsupported-architecture-exception");
+#endif
 }
 
 static void qrr_full_advance_context(QrrFullPathState *state, int syscall_nr,

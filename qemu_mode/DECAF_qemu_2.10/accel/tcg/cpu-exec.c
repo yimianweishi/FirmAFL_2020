@@ -964,6 +964,11 @@ bool delete_pgd(int pgd)
 /* Full-system QRR v12 includes execution/process-isolated replay keys. */
 #include "qrr-full-tcg.h"
 
+void qrr_full_tcg_tb_interrupted(CPUState *cpu, bool state_restored)
+{
+    qrr_full_tb_interrupted(cpu, state_restored);
+}
+
 static DECAF_Handle qrr_exec_connector_handle = DECAF_NULL_HANDLE;
 
 static void qrr_exec_connector_callback(DECAF_Callback_Params *params)
@@ -1251,7 +1256,7 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
     }
 #endif /* DEBUG_DISAS */
 
-    qrr_full_note_tb(cpu, itb);
+    qrr_full_tb_before(cpu, itb);
 
     cpu->can_do_io = !use_icount;
 
@@ -1260,6 +1265,7 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
     last_tb = (TranslationBlock *)(ret & ~TB_EXIT_MASK);
     tb_exit = ret & TB_EXIT_MASK;
     trace_exec_tb_exit(last_tb, tb_exit);
+    qrr_full_tb_after(cpu, itb, tb_exit <= TB_EXIT_IDX1);
 
     if (tb_exit > TB_EXIT_IDX1) {
         /* We didn't start executing this TB (eg because the instruction
