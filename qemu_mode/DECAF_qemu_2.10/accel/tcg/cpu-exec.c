@@ -1602,6 +1602,10 @@ static inline TranslationBlock *tb_find(CPUState *cpu,
     uint32_t flags;
     bool have_tb_lock = false;
 
+    if (qrr_full_user_precision_prepare(cpu)) {
+        last_tb = NULL;
+    }
+
     /* we record a subset of the CPU state. It will
        always be the same before a given translated block
        is executed. */
@@ -3679,6 +3683,20 @@ skip_to_pos:
             }
             */
             TranslationBlock *tb = tb_find(cpu, last_tb, tb_exit);
+            uint32_t qrr_precision_limit =
+                qrr_full_user_precision_limit(cpu, tb);
+
+            if (qrr_precision_limit && qrr_precision_limit < tb->icount) {
+                /* Only PCs learned from actual delivered-signal or Linux VM
+                 * fault events are split.  Execute the exact prefix without
+                 * caching it so the watched instruction becomes the next TB
+                 * entry and its occurrence is independent of QEMU's normal
+                 * TB shape. */
+                cpu_exec_nocache(cpu, qrr_precision_limit, tb, false);
+                last_tb = NULL;
+                tb_exit = 0;
+                continue;
+            }
             cpu_loop_exec_tb(cpu, tb, &last_tb, &tb_exit);
 
             /* Try to align the host and virtual clocks

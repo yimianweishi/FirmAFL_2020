@@ -18,7 +18,7 @@ typedef struct QrrFullOpenHow {
 #define QRR_FULL_HOST_NR_OPENAT2 437
 #endif
 #endif
-#define QRR_FULL_RESULT_MAGIC "QEMU_RESULT_REPLAY\t1\tqemu-result-replay-v13"
+#define QRR_FULL_RESULT_MAGIC "QEMU_RESULT_REPLAY\t1\tqemu-result-replay-v14"
 #define QRR_FULL_RESULT_COLUMNS \
     "key\tpath_hash\tdep_hash\tsyscall_nr\tsequence\tret\tout_arg\tout_hex\tprocess_token"
 #define QRR_FULL_SCHEDULE_MAGIC \
@@ -42,9 +42,9 @@ typedef struct QrrFullOpenHow {
 #define QRR_FULL_LAYOUT_COLUMNS \
     "process_token\trecord_sequence\trecord_kind\tstart\tend\tflags\tpgoff\tstart_brk\tinitial_brk\tstart_stack\tentry_pc\tinitial_sp\tauxv_hex\tstack_hex\tfile_hex\tcontent_hex"
 #define QRR_FULL_MMAP_MAGIC \
-    "QEMU_RESULT_MMAP\t1\tqemu-result-mmap-v4"
+    "QEMU_RESULT_MMAP\t1\tqemu-result-mmap-v7"
 #define QRR_FULL_MMAP_COLUMNS \
-    "process_token\tevent_sequence\trecord_kind\tmapping_id\tmmap_sequence\tmmap_key\tstart\tlength\tprot\tflags\tfd\tfile_offset\tpage_offset\tanchor_kind\tsyscall_key\tsyscall_sequence\tsyscall_nr\tfault_pc\tpath_hash\tdep_hash\taccess_kind\tdev\tinode\tpath_hex\tpage_hex"
+    "process_token\tevent_sequence\trecord_kind\tmapping_id\tmmap_sequence\tmmap_key\tstart\tlength\tprot\tflags\tfd\tfile_offset\tpage_offset\tanchor_kind\tsyscall_key\tsyscall_sequence\tsyscall_nr\tfault_pc\tedge_from_pc\tedge_to_pc\tedge_occurrence\tdelivered_signal_sequence\tpath_hash\tdep_hash\taccess_kind\tdev\tinode\tpath_hex\tpage_hex\tdelay_slot"
 #define QRR_FULL_FNV64_OFFSET UINT64_C(1469598103934665603)
 #define QRR_FULL_FNV64_PRIME UINT64_C(1099511628211)
 #define QRR_FULL_ROOT_PROCESS_PREFIX UINT64_C(0x8000000000000000)
@@ -58,6 +58,7 @@ typedef struct QrrFullOpenHow {
 #define QRR_FULL_RESULT_OUT_ARG_EXEC_UNBIND 9
 #define QRR_FULL_RESULT_OUT_ARG_EXEC_REBIND 10
 #define QRR_FULL_RESULT_OUT_ARG_SHMAT 11
+#define QRR_FULL_RESULT_OUT_ARG_EXEC_TERMINATE 12
 #define QRR_FULL_SHMAT_VERSION 1
 #define QRR_FULL_SHMAT_HEADER_SIZE 32
 #define QRR_FULL_BUNDLE_VERSION 2
@@ -155,6 +156,16 @@ typedef struct QrrFullUserEdgeCount {
     struct QrrFullUserEdgeCount *next;
 } QrrFullUserEdgeCount;
 
+typedef struct QrrFullUserPrecisionWatch {
+    target_ulong pgd;
+    target_ulong edge_from_pc;
+    target_ulong pc;
+    uint64_t baseline_syscall_sequence;
+    uint64_t baseline_occurrence;
+    bool delay_slot;
+    struct QrrFullUserPrecisionWatch *next;
+} QrrFullUserPrecisionWatch;
+
 typedef struct QrrFullTbPending {
     CPUState *cpu;
     target_ulong pgd;
@@ -162,6 +173,10 @@ typedef struct QrrFullTbPending {
     uint32_t tb_size;
     target_ulong edge_from_pc;
     uint64_t edge_occurrence;
+    bool have_delay_edge;
+    target_ulong delay_edge_from_pc;
+    target_ulong delay_edge_to_pc;
+    uint64_t delay_edge_occurrence;
     struct QrrFullTbPending *next;
 } QrrFullTbPending;
 
@@ -331,6 +346,10 @@ typedef struct QrrFullPageFaultCall {
     uint64_t syscall_key;
     uint64_t syscall_sequence;
     int syscall_nr;
+    target_ulong edge_from_pc;
+    target_ulong edge_to_pc;
+    uint64_t edge_occurrence;
+    uint64_t delivered_signal_sequence;
     uint64_t path_hash;
     uint64_t dep_hash;
     target_ulong do_page_fault_return_pc;
@@ -370,6 +389,9 @@ static QrrFullLayoutCaptured *qrr_full_layout_captured;
 static QrrFullMmapMapping *qrr_full_mmap_mappings;
 static QrrFullPageFaultCall *qrr_full_page_fault_calls;
 static QrrFullUserEdgeCount *qrr_full_user_edge_counts;
+static QrrFullUserPrecisionWatch *qrr_full_user_precision_watches;
+static bool qrr_full_user_precision_flush_pending;
+static bool qrr_full_debug_precision_edges;
 static QrrFullTbPending *qrr_full_tb_pending;
 static target_ulong qrr_full_last_kernel_thread_info;
 static bool qrr_full_have_last_kernel_thread_info;
@@ -390,12 +412,17 @@ static target_ulong qrr_full_handle_mm_fault;
 
 static char *qrr_full_hex_from_bytes(const unsigned char *bytes,
                                      size_t length);
+static QrrFullExecPending *qrr_full_exec_pending_for_task(
+    target_ulong task);
 static void qrr_full_remove_exec_pending(QrrFullExecPending *pending);
+static bool qrr_full_record_terminal_exec(target_ulong source_pgd,
+                                          target_ulong task);
 static void qrr_full_complete_exec_transition(QrrFullExecPending *pending,
                                               target_ulong pgd,
                                               const char *completion);
 static void qrr_full_note_current_target_task(CPUState *cpu,
                                               target_ulong pgd);
+static target_ulong qrr_full_current_pgd(CPUState *cpu);
 static target_ulong qrr_full_sem_array_base_offset;
 static target_ulong qrr_full_sem_array_nsems_offset;
 static target_ulong qrr_full_sem_size;
@@ -953,6 +980,7 @@ static bool qrr_full_init(void)
     const char *mmap_path;
     const char *procinfo_path;
     const char *fork_descendants;
+    const char *debug_precision_edges;
     bool collection_requested;
     char profile_error[128];
 
@@ -974,12 +1002,28 @@ static bool qrr_full_init(void)
     mmap_path = getenv("QRR_FULL_TCG_MMAPS");
     procinfo_path = getenv("QRR_FULL_TCG_PROCINFO");
     fork_descendants = getenv("QRR_FULL_TCG_FORK_DESCENDANTS");
+    debug_precision_edges = getenv("QRR_FULL_TCG_DEBUG_EDGES");
     collection_requested =
         (table_path && table_path[0]) ||
         (schedule_path && schedule_path[0]) ||
         (event_path && event_path[0]) ||
         (exec_path && exec_path[0]) || (signal_path && signal_path[0]) ||
         (layout_path && layout_path[0]) || (mmap_path && mmap_path[0]);
+    /* cpu_tb_exec() is the only exact per-TB observation boundary in this
+     * QEMU 2.10 collector.  Its generated direct and indirect exits can
+     * otherwise enter another TB without returning through that boundary.
+     * Enabling nochain only after the first page-fault watch is learned is
+     * too late: the currently executing kernel chain can return to user mode
+     * and execute repeated anchor edges before tb_find() gets control again.
+     * Select nochain at QRR initialization, before subsequent guest code is
+     * translated.  qrr_full_tb_before() still rejects every non-target PGD,
+     * so this changes translation policy, not collection scope. */
+    if (collection_requested &&
+        !qemu_loglevel_mask(CPU_LOG_TB_NOCHAIN)) {
+        qemu_set_log(qemu_loglevel | CPU_LOG_TB_NOCHAIN);
+        fprintf(stderr,
+                "qrr-full: exact TB observation enabled with nochain\n");
+    }
     if (max_blob && max_blob[0]) {
         qrr_full_max_blob = strtoull(max_blob, NULL, 0);
     }
@@ -992,6 +1036,8 @@ static bool qrr_full_init(void)
     }
     qrr_full_follow_fork_descendants =
         fork_descendants && strcmp(fork_descendants, "1") == 0;
+    qrr_full_debug_precision_edges =
+        debug_precision_edges && strcmp(debug_precision_edges, "1") == 0;
     qrr_full_target_name = target_name && target_name[0] ? target_name : NULL;
     if (collection_requested) {
         if (!qrr_full_target_name) {
@@ -1313,6 +1359,173 @@ static void qrr_full_user_edge_remove_all(target_ulong pgd)
     }
 }
 
+static void qrr_full_user_precision_remove_all(target_ulong pgd)
+{
+    QrrFullUserPrecisionWatch **link = &qrr_full_user_precision_watches;
+
+    while (*link) {
+        QrrFullUserPrecisionWatch *watch = *link;
+
+        if (watch->pgd == pgd) {
+            *link = watch->next;
+            free(watch);
+            continue;
+        }
+        link = &watch->next;
+    }
+}
+
+static bool qrr_full_user_precision_watched(target_ulong pgd,
+                                            target_ulong pc,
+                                            bool delay_slot)
+{
+    QrrFullUserPrecisionWatch *watch;
+
+    for (watch = qrr_full_user_precision_watches; watch;
+         watch = watch->next) {
+        if (watch->pgd == pgd && watch->pc == pc &&
+            watch->delay_slot == delay_slot) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static QrrFullUserPrecisionWatch *qrr_full_user_precision_find(
+    target_ulong pgd, target_ulong edge_from_pc, target_ulong edge_to_pc,
+    bool delay_slot)
+{
+    QrrFullUserPrecisionWatch *watch;
+
+    for (watch = qrr_full_user_precision_watches; watch;
+         watch = watch->next) {
+        if (watch->pgd == pgd && watch->edge_from_pc == edge_from_pc &&
+            watch->pc == edge_to_pc && watch->delay_slot == delay_slot) {
+            return watch;
+        }
+    }
+    return NULL;
+}
+
+static void qrr_full_user_precision_add(
+    target_ulong pgd, target_ulong edge_from_pc, target_ulong edge_to_pc,
+    bool delay_slot, uint64_t syscall_sequence,
+    uint64_t baseline_occurrence)
+{
+    QrrFullUserPrecisionWatch *watch;
+
+    if (!edge_to_pc || (delay_slot && edge_to_pc < 4) ||
+        qrr_full_user_precision_find(pgd, edge_from_pc, edge_to_pc,
+                                     delay_slot)) {
+        return;
+    }
+    watch = calloc(1, sizeof(*watch));
+    if (!watch) {
+        fprintf(stderr,
+                "qrr-full: cannot allocate exact user-edge watch\n");
+        exit(2);
+    }
+    watch->pgd = pgd;
+    watch->edge_from_pc = edge_from_pc;
+    watch->pc = edge_to_pc;
+    watch->baseline_syscall_sequence = syscall_sequence;
+    watch->baseline_occurrence = baseline_occurrence;
+    watch->delay_slot = delay_slot;
+    watch->next = qrr_full_user_precision_watches;
+    qrr_full_user_precision_watches = watch;
+    qrr_full_user_precision_flush_pending = true;
+}
+
+/* A learned anchor can lie inside an already cached or indirectly chained
+ * TB.  QEMU 2.10 has no per-TB CF_NO_GOTO_PTR flag: clearing last_tb only
+ * prevents tb_add_jump(), while tcg_gen_lookup_and_goto_ptr() can still skip
+ * the outer cpu_tb_exec() callback.  Enable CPU_LOG_TB_NOCHAIN when the first
+ * exact watch is learned and flush translated code so both direct and
+ * indirect chaining stop.  QRR callbacks remain target-PGD filtered; this
+ * global translation policy is required only because 2.10 cannot express it
+ * per target TB. */
+static bool qrr_full_user_precision_prepare(CPUState *cpu)
+{
+    QrrFullUserPrecisionWatch *watch;
+    target_ulong pgd;
+    bool active = false;
+
+    if (!qrr_full_enabled || !qrr_full_user_precision_watches) {
+        return false;
+    }
+    if (qrr_full_user_precision_flush_pending) {
+        if (!qemu_loglevel_mask(CPU_LOG_TB_NOCHAIN)) {
+            qemu_set_log(qemu_loglevel | CPU_LOG_TB_NOCHAIN);
+        }
+        tb_flush(cpu);
+        qrr_full_user_precision_flush_pending = false;
+    }
+    pgd = qrr_full_current_pgd(cpu);
+    for (watch = qrr_full_user_precision_watches; watch;
+         watch = watch->next) {
+        if (watch->pgd == pgd) {
+            active = true;
+            break;
+        }
+    }
+    return active;
+}
+
+/* Once a user-mode mmap fault or signal has exposed an exact instruction
+ * edge, make all later executions of that PC visible as their own TB edge.
+ * This gives occurrence a QEMU-version-independent meaning without imposing
+ * global single stepping. */
+static uint32_t qrr_full_user_precision_limit(CPUState *cpu,
+                                              TranslationBlock *tb)
+{
+#ifdef TARGET_MIPS
+    QrrFullUserPrecisionWatch *watch;
+    target_ulong pgd;
+    uint32_t limit = 0;
+
+    if (!qrr_full_enabled || !tb || !qrr_full_user_pc(tb->pc)) {
+        return 0;
+    }
+    pgd = qrr_full_current_pgd(cpu);
+    if (!qrr_full_trace_pgd(pgd)) {
+        return 0;
+    }
+    for (watch = qrr_full_user_precision_watches; watch;
+         watch = watch->next) {
+        uint64_t distance;
+        uint32_t candidate;
+        target_ulong anchor_pc;
+
+        if (watch->pgd != pgd) {
+            continue;
+        }
+        anchor_pc = watch->delay_slot ? watch->pc - 4 : watch->pc;
+        if (anchor_pc < tb->pc || anchor_pc >= tb->pc + tb->size ||
+            (anchor_pc & 3) != 0 ||
+            (tb->pc & 3) != 0) {
+            continue;
+        }
+        distance = anchor_pc - tb->pc;
+        /* A delay-slot anchor must execute its branch and delay instruction
+         * in one normal MIPS TB.  Splitting at the delay instruction would
+         * discard the branch target state and change guest control flow. */
+        if (!distance && watch->delay_slot) {
+            continue;
+        }
+        candidate = distance ? distance / 4 : 1;
+        if (candidate && candidate <= tb->icount &&
+            (!limit || candidate < limit)) {
+            limit = candidate;
+        }
+    }
+    return limit;
+#else
+    (void)cpu;
+    (void)tb;
+    return 0;
+#endif
+}
+
 static QrrFullUserEdgeCount *qrr_full_user_edge_find(target_ulong pgd,
                                                       target_ulong from_pc,
                                                       target_ulong to_pc)
@@ -1343,6 +1556,47 @@ static uint64_t qrr_full_user_edge_next_occurrence(target_ulong pgd,
         exit(2);
     }
     return entry ? entry->occurrence + 1 : 1;
+}
+
+/* Exact event occurrences start when the first real signal delivery or Linux
+ * VM fault teaches QRR to watch that edge.  TB boundaries which happened to
+ * expose the same from/to pair before that point are an implementation detail
+ * of the collector and must not leak into a cross-version replay anchor. */
+static uint64_t qrr_full_user_precision_next_occurrence(
+    target_ulong pgd, uint64_t syscall_sequence, target_ulong from_pc,
+    target_ulong to_pc, bool delay_slot)
+{
+    QrrFullUserPrecisionWatch *watch = qrr_full_user_precision_find(
+        pgd, from_pc, to_pc, delay_slot);
+    uint64_t next = qrr_full_user_edge_next_occurrence(pgd, from_pc, to_pc);
+    uint64_t baseline = 0;
+
+    if (!watch) {
+        return 1;
+    }
+    if (watch->baseline_syscall_sequence == syscall_sequence) {
+        baseline = watch->baseline_occurrence;
+    }
+    if (next <= baseline) {
+        fprintf(stderr,
+                "qrr-full: precision edge baseline invalid pgd="
+                TARGET_FMT_lx " edge=" TARGET_FMT_lx "->" TARGET_FMT_lx
+                " syscall_sequence=%" PRIu64 " next=%" PRIu64
+                " baseline=%" PRIu64 "\n",
+                pgd, from_pc, to_pc, syscall_sequence, next, baseline);
+        exit(2);
+    }
+    return next - baseline;
+}
+
+static uint64_t qrr_full_user_edge_current_occurrence(target_ulong pgd,
+                                                       target_ulong from_pc,
+                                                       target_ulong to_pc)
+{
+    QrrFullUserEdgeCount *entry = qrr_full_user_edge_find(
+        pgd, from_pc, to_pc);
+
+    return entry ? entry->occurrence : 0;
 }
 
 static uint64_t qrr_full_user_edge_note(target_ulong pgd,
@@ -1439,12 +1693,30 @@ static void qrr_full_user_edge_clone(target_ulong source_pgd,
     }
 }
 
+static void qrr_full_user_precision_clone(target_ulong source_pgd,
+                                          target_ulong target_pgd)
+{
+    QrrFullUserPrecisionWatch *watch;
+
+    qrr_full_user_precision_remove_all(target_pgd);
+    for (watch = qrr_full_user_precision_watches; watch;
+         watch = watch->next) {
+        if (watch->pgd == source_pgd) {
+            qrr_full_user_precision_add(
+                target_pgd, watch->edge_from_pc, watch->pc,
+                watch->delay_slot, watch->baseline_syscall_sequence,
+                watch->baseline_occurrence);
+        }
+    }
+}
+
 static void qrr_full_reset_path_context(target_ulong pgd,
                                         uint64_t process_token)
 {
     QrrFullPathState *state;
 
     qrr_full_user_edge_remove_all(pgd);
+    qrr_full_user_precision_remove_all(pgd);
     qrr_full_tb_pending_remove_pgd(pgd);
     for (state = qrr_full_paths; state; state = state->next) {
         if (state->pgd == pgd) {
@@ -1535,6 +1807,43 @@ static void qrr_full_note_exit_connector(target_ulong task)
         if (target->have_task && target->task == task) {
             target_ulong pgd = target->pgd;
             uint64_t process_token = target->process_token;
+            QrrFullExecPending *exec_pending =
+                qrr_full_exec_pending_for_task(task);
+            bool terminal_exec;
+
+            /* proc_exec_connector is the successful-exec authority and a
+             * return to entry_pc+4 is the failed-but-returning authority.
+             * Reaching proc_exit_connector for the exact, single-task
+             * process while its logical exec syscall is still pending proves
+             * the third Linux outcome: exec crossed its point of no return
+             * and terminated the process in-kernel.  The QrrFullPending is
+             * authoritative for syscall lifetime.  QrrFullExecPending only
+             * carries entry-side filename/argv metadata and may already have
+             * been discarded after an apparent old-image return-PC visit; it
+             * must not gate recording the observable kernel outcome. */
+            if (exec_pending && exec_pending->pgd != pgd) {
+                fprintf(stderr,
+                        "qrr-full: terminal exec auxiliary identity conflict"
+                        " task=" TARGET_FMT_lx " pgd=" TARGET_FMT_lx
+                        " pending_pgd=" TARGET_FMT_lx "\n",
+                        task, pgd, exec_pending->pgd);
+                exit(2);
+            }
+            terminal_exec = qrr_full_record_terminal_exec(pgd, task);
+            if (terminal_exec && !exec_pending) {
+                fprintf(stderr,
+                        "qrr-full: terminal exec used authoritative syscall"
+                        " pending without auxiliary exec metadata task="
+                        TARGET_FMT_lx " pgd=" TARGET_FMT_lx "\n",
+                        task, pgd);
+            } else if (!terminal_exec && exec_pending) {
+                fprintf(stderr,
+                        "qrr-full: terminal exec auxiliary has no matching"
+                        " syscall task=" TARGET_FMT_lx
+                        " pgd=" TARGET_FMT_lx "\n",
+                        task, pgd);
+                exit(2);
+            }
 
             fprintf(stderr,
                     "qrr-full: exact target process exit task="
@@ -1983,6 +2292,7 @@ static void qrr_full_unbind_process(target_ulong pgd, const char *process_name)
     qrr_full_fd_remove_all(pgd);
     qrr_full_mmap_remove_all(pgd);
     qrr_full_user_edge_remove_all(pgd);
+    qrr_full_user_precision_remove_all(pgd);
     qrr_full_tb_pending_remove_pgd(pgd);
     if (pgd == qrr_full_selected_pgd &&
         !qrr_full_follow_fork_descendants) {
@@ -2315,6 +2625,32 @@ static void qrr_full_tb_before(CPUState *cpu, TranslationBlock *itb)
         state->previous_user_edge_pc : 0;
     pending->edge_occurrence = qrr_full_user_edge_next_occurrence(
         pgd, pending->edge_from_pc, pc);
+    if (qrr_full_debug_precision_edges &&
+        qrr_full_user_precision_watched(pgd, pc, false)) {
+        fprintf(stderr,
+                "qrr-full: precision-edge pgd=" TARGET_FMT_lx
+                " edge=" TARGET_FMT_lx "->" TARGET_FMT_lx
+                "#%" PRIu64 " tb_size=%u tb_icount=%u\n",
+                pgd, pending->edge_from_pc, pc,
+                pending->edge_occurrence, itb->size, itb->icount);
+    }
+    {
+        QrrFullUserPrecisionWatch *watch;
+
+        for (watch = qrr_full_user_precision_watches; watch;
+             watch = watch->next) {
+            if (watch->pgd == pgd && watch->delay_slot &&
+                watch->pc >= 4 && watch->pc - 4 == pc) {
+                pending->have_delay_edge = true;
+                pending->delay_edge_from_pc = pc;
+                pending->delay_edge_to_pc = watch->pc;
+                pending->delay_edge_occurrence =
+                    qrr_full_user_edge_next_occurrence(
+                        pgd, pc, watch->pc);
+                break;
+            }
+        }
+    }
     pending->next = qrr_full_tb_pending;
     qrr_full_tb_pending = pending;
 }
@@ -2361,6 +2697,23 @@ static void qrr_full_tb_commit(CPUState *cpu,
                 pending->pgd, pending->edge_from_pc, pending->tb_pc,
                 pending->edge_occurrence, occurrence);
         exit(2);
+    }
+    if (pending->have_delay_edge &&
+        last_completed_pc >= pending->delay_edge_to_pc) {
+        occurrence = qrr_full_user_edge_note(
+            pending->pgd, pending->delay_edge_from_pc,
+            pending->delay_edge_to_pc);
+        if (occurrence != pending->delay_edge_occurrence) {
+            fprintf(stderr,
+                    "qrr-full: delay edge occurrence changed pgd="
+                    TARGET_FMT_lx " edge=" TARGET_FMT_lx "->"
+                    TARGET_FMT_lx " expected=%" PRIu64
+                    " actual=%" PRIu64 "\n",
+                    pending->pgd, pending->delay_edge_from_pc,
+                    pending->delay_edge_to_pc,
+                    pending->delay_edge_occurrence, occurrence);
+            exit(2);
+        }
     }
     state->previous_user_edge_pc = last_completed_pc;
     state->have_previous_user_edge_pc = true;
@@ -2436,12 +2789,12 @@ static void qrr_full_tb_interrupted(CPUState *cpu, bool state_restored)
                     pending->pgd, fault_pc);
             exit(2);
         }
-        state->have_interrupted_user_edge = true;
-        state->interrupted_edge_from_pc = pending->edge_from_pc;
         state->interrupted_tb_pc = pending->tb_pc;
         state->interrupted_next_pc = fault_pc;
 
         if (fault_pc == pending->tb_pc) {
+            state->have_interrupted_user_edge = true;
+            state->interrupted_edge_from_pc = pending->edge_from_pc;
             qrr_full_tb_discard(
                 cpu, delay_slot ? "first-instruction-delay-slot-exception" :
                                   "first-instruction-exception");
@@ -2463,11 +2816,22 @@ static void qrr_full_tb_interrupted(CPUState *cpu, bool state_restored)
             instruction_size = 2;
         }
         if (fault_pc < pending->tb_pc + instruction_size) {
+            state->have_interrupted_user_edge = true;
+            state->interrupted_edge_from_pc = pending->edge_from_pc;
             qrr_full_tb_discard(
                 cpu, "no-completed-instruction-before-exception");
             return;
         }
         last_completed_pc = fault_pc - instruction_size;
+        /* A precise exception in the middle of a TB occurs after the
+         * preceding guest instruction completed.  Anchor the interrupted
+         * instruction to that actual predecessor, not to the predecessor of
+         * the whole TB.  In particular, repeated Linux page-fault retries of
+         * one instruction must retain the same uncommitted semantic edge so
+         * all materialized pages can be restored before that instruction is
+         * finally executed by qemu-user. */
+        state->have_interrupted_user_edge = true;
+        state->interrupted_edge_from_pc = last_completed_pc;
         qrr_full_tb_commit(cpu, last_completed_pc,
                            delay_slot ? "delay-slot-exception" :
                                         "mid-tb-exception");
@@ -4573,6 +4937,7 @@ static void qrr_full_clone_process_state(target_ulong source_pgd,
         target_state->pgd = target_pgd;
         target_state->next = next;
         qrr_full_user_edge_clone(source_pgd, target_pgd);
+        qrr_full_user_precision_clone(source_pgd, target_pgd);
     }
     for (fd_path = qrr_full_fd_paths; fd_path; fd_path = fd_path->next) {
         if (fd_path->pgd == source_pgd) {
@@ -4719,13 +5084,15 @@ static void qrr_full_emit_inherited_mmap_mapping(
             "\t%" PRIu64 "\t%016" PRIx64 "\t%016" PRIx64
             "\t%016" PRIx64 "\t%016" PRIx64 "\t%016" PRIx64
             "\t%d\t%016" PRIx64 "\t%016x\t-\t%016x\t%" PRIu64
-            "\t%d\t%016x\t%016" PRIx64 "\t%016" PRIx64
-            "\t-\t%016x\t%016x\t%s\t-\n",
+            "\t%d\t%016x\t%016x\t%016x\t%" PRIu64 "\t%" PRIu64
+            "\t%016" PRIx64 "\t%016" PRIx64
+            "\t-\t%016x\t%016x\t%s\t-\t0\n",
             mapping->process_token, state->mmap_event_seq,
             mapping->mapping_id, mapping->mmap_sequence, mapping->mmap_key,
             (uint64_t)mapping->start, (uint64_t)mapping->length,
             (uint64_t)mapping->prot, (uint64_t)mapping->flags, mapping->fd,
             mapping->file_offset, 0, 0, (uint64_t)0, 0, 0,
+            0, 0, (uint64_t)0, (uint64_t)0,
             (uint64_t)0, (uint64_t)0, 0, 0, path_column);
     if (fflush(qrr_full_mmap_fp) != 0) {
         fprintf(stderr, "qrr-full: inherited mmap table flush failed: %s\n",
@@ -4977,6 +5344,7 @@ static void qrr_full_note_fork_connector(CPUState *cpu,
         /* A process token is an execution instance.  Edge occurrences begin
          * empty in the child on both collection and replay. */
         qrr_full_user_edge_remove_all(child_identity.pgd);
+        qrr_full_user_precision_remove_all(child_identity.pgd);
     }
     for (fd_path = pending->fd_paths; fd_path; fd_path = fd_path->next) {
         qrr_full_fd_set(child_identity.pgd, fd_path->fd, fd_path->path);
@@ -5197,13 +5565,15 @@ static bool qrr_full_record_mmap_mapping(CPUState *cpu,
             "\t%" PRIu64 "\t%016" PRIx64 "\t%016" PRIx64
             "\t%016" PRIx64 "\t%016" PRIx64 "\t%016" PRIx64
             "\t%d\t%016" PRIx64 "\t%016x\t-\t%016x\t%" PRIu64
-            "\t%d\t%016x\t%016" PRIx64 "\t%016" PRIx64
-            "\t-\t%016x\t%016x\t%s\t-\n",
+            "\t%d\t%016x\t%016x\t%016x\t%" PRIu64 "\t%" PRIu64
+            "\t%016" PRIx64 "\t%016" PRIx64
+            "\t-\t%016x\t%016x\t%s\t-\t0\n",
             mapping->process_token, state->mmap_event_seq,
             mapping->mapping_id, mapping->mmap_sequence, mapping->mmap_key,
             (uint64_t)mapping->start, (uint64_t)mapping->length,
             (uint64_t)mapping->prot, (uint64_t)mapping->flags, mapping->fd,
             mapping->file_offset, 0, 0, (uint64_t)0, 0, 0,
+            0, 0, (uint64_t)0, (uint64_t)0,
             pending->path_hash, pending->dep_hash, 0, 0, path_column);
     free(path_hex);
 
@@ -5265,14 +5635,16 @@ static bool qrr_full_record_mmap_mapping(CPUState *cpu,
                 "\t%016" PRIx64 "\t%016" PRIx64 "\t%016" PRIx64
                 "\t%d\t%016" PRIx64 "\t%016" PRIx64
                 "\t-\t%016x\t%" PRIu64 "\t%d\t%016x"
+                "\t%016x\t%016x\t%" PRIu64 "\t%" PRIu64
                 "\t%016" PRIx64 "\t%016" PRIx64 "\t%s\t%016x"
-                "\t%016x\t-\t%s\n",
+                "\t%016x\t-\t%s\t0\n",
                 mapping->process_token, state->mmap_event_seq,
                 mapping->mapping_id, mapping->mmap_sequence, mapping->mmap_key,
                 (uint64_t)mapping->start, (uint64_t)mapping->length,
                 (uint64_t)mapping->prot, (uint64_t)mapping->flags, mapping->fd,
                 mapping->file_offset, (uint64_t)page_offset,
-                (uint64_t)0, 0, 0, 0, 0, 0,
+                (uint64_t)0, 0, 0, 0,
+                0, 0, (uint64_t)0, (uint64_t)0, 0, 0,
                 QRR_FULL_MMAP_SNAPSHOT_ACCESS, 0, 0, snapshot_hex);
         fprintf(stderr,
                 "qrr-full: mmap snapshot process=%016" PRIx64
@@ -5621,8 +5993,10 @@ static void qrr_full_record_materialized_mmap_page(
             "\t%016" PRIx64 "\t%016" PRIx64 "\t%016" PRIx64
             "\t%d\t%016" PRIx64 "\t%016" PRIx64 "\t%s"
             "\t%016" PRIx64 "\t%" PRIu64 "\t%d\t%016" PRIx64
-            "\t%016" PRIx64 "\t%016" PRIx64 "\t%s\t%016x\t%016x"
-            "\t-\t%s\n",
+            "\t%016" PRIx64 "\t%016" PRIx64 "\t%" PRIu64
+            "\t%" PRIu64 "\t%016" PRIx64 "\t%016" PRIx64
+            "\t%s\t%016x\t%016x"
+            "\t-\t%s\t%d\n",
             call->process_token, state->mmap_event_seq,
             mapping->mapping_id, mapping->mmap_sequence, mapping->mmap_key,
             (uint64_t)mapping->start, (uint64_t)mapping->length,
@@ -5630,14 +6004,25 @@ static void qrr_full_record_materialized_mmap_page(
             mapping->file_offset, (uint64_t)page_offset,
             call->syscall_anchor ? "syscall" : "user",
             call->syscall_key, call->syscall_sequence, call->syscall_nr,
-            (uint64_t)call->fault_pc, path_hash, dep_hash,
-            call->access_kind, 0, 0, hex);
+            (uint64_t)call->fault_pc, (uint64_t)call->edge_from_pc,
+            (uint64_t)call->edge_to_pc, call->edge_occurrence,
+            call->delivered_signal_sequence, path_hash, dep_hash,
+            call->access_kind, 0, 0, hex,
+            !!(call->fault_cause & QRR_FULL_MIPS_CAUSE_BD));
     free(hex);
     if (fflush(qrr_full_mmap_fp) != 0) {
         fprintf(stderr, "qrr-full: cannot flush mmap fault event: %s\n",
                 strerror(errno));
         free(page_record);
         exit(2);
+    }
+    if (!call->syscall_anchor) {
+        qrr_full_user_precision_add(
+            call->pgd, call->edge_from_pc, call->edge_to_pc,
+            !!(call->fault_cause & QRR_FULL_MIPS_CAUSE_BD),
+            state->syscall_seq,
+            qrr_full_user_edge_current_occurrence(
+                call->pgd, call->edge_from_pc, call->edge_to_pc));
     }
     page_record->page_offset = page_offset;
     page_record->materialized_by_fault = true;
@@ -5648,12 +6033,16 @@ static void qrr_full_record_materialized_mmap_page(
             " mapping=%016" PRIx64 " event=%" PRIu64
             " page=" TARGET_FMT_lx " offset=" TARGET_FMT_lx
             " anchor=%s syscall_sequence=%" PRIu64
+            " edge=" TARGET_FMT_lx "->" TARGET_FMT_lx "#%" PRIu64
+            " delivered_signal_sequence=%" PRIu64
             " fault_epc=" TARGET_FMT_lx " fault_cause=%08" PRIx32
             " delay_slot=%d fault_pc=" TARGET_FMT_lx " access=%s\n",
             call->process_token, mapping->mapping_id,
             state->mmap_event_seq, page, page_offset,
             call->syscall_anchor ? "syscall" : "user",
-            call->syscall_sequence, call->fault_epc, call->fault_cause,
+            call->syscall_sequence, call->edge_from_pc, call->edge_to_pc,
+            call->edge_occurrence, call->delivered_signal_sequence,
+            call->fault_epc, call->fault_cause,
             !!(call->fault_cause & QRR_FULL_MIPS_CAUSE_BD), call->fault_pc,
             call->access_kind);
 }
@@ -5764,6 +6153,38 @@ static void qrr_full_note_page_fault(CPUState *cpu, target_ulong pc)
         if (qrr_full_user_pc(fault_pc)) {
             call->syscall_anchor = false;
             call->syscall_sequence = state->syscall_seq;
+            if (state->have_interrupted_user_edge &&
+                state->interrupted_next_pc != fault_pc) {
+                fprintf(stderr,
+                        "qrr-full: user mmap fault contradicts saved"
+                        " interrupted edge pgd=" TARGET_FMT_lx
+                        " process=%016" PRIx64
+                        " fault_pc=" TARGET_FMT_lx
+                        " have_interrupt=%d interrupt_next=" TARGET_FMT_lx
+                        "\n",
+                        pgd, mapping->process_token, fault_pc,
+                        state->have_interrupted_user_edge,
+                        state->interrupted_next_pc);
+                free(call);
+                exit(2);
+            }
+            /* cpu_loop_exit() has no host return PC to restore for a few
+             * architecturally precise MIPS exceptions.  In that case the
+             * pending TB was discarded, while pt_regs still supplies the
+             * exact faulting instruction.  Use the last completed user PC
+             * exactly as signal delivery does at a kernel-to-user boundary;
+             * this is the semantic execution edge, not a PC-only anchor. */
+            call->edge_from_pc = state->have_interrupted_user_edge ?
+                state->interrupted_edge_from_pc :
+                (state->have_previous_user_edge_pc ?
+                 state->previous_user_edge_pc : 0);
+            call->edge_to_pc = fault_pc;
+            call->edge_occurrence =
+                qrr_full_user_precision_next_occurrence(
+                    pgd, state->syscall_seq, call->edge_from_pc,
+                    call->edge_to_pc,
+                    !!(call->fault_cause & QRR_FULL_MIPS_CAUSE_BD));
+            call->delivered_signal_sequence = state->signal_seq;
             qrr_full_current_mmap_context(
                 state, &call->path_hash, &call->dep_hash);
         } else {
@@ -5784,6 +6205,7 @@ static void qrr_full_note_page_fault(CPUState *cpu, target_ulong pc)
             call->syscall_key = pending->key;
             call->syscall_sequence = pending->sequence;
             call->syscall_nr = pending->syscall_nr;
+            call->delivered_signal_sequence = state->signal_seq;
             call->path_hash = pending->path_hash;
             call->dep_hash = pending->dep_hash;
         }
@@ -6070,6 +6492,52 @@ static void qrr_full_record_successful_exec(target_ulong source_pgd,
                    target_match ? "exec_target" : "exec_non_target");
     free(pending->open_path);
     free(pending);
+}
+
+static bool qrr_full_record_terminal_exec(target_ulong source_pgd,
+                                          target_ulong task)
+{
+    QrrFullPending *last = NULL;
+    QrrFullPending *pending = qrr_full_pending_head;
+
+    while (pending) {
+        if (pending->pgd == source_pgd &&
+            qrr_full_is_execve_syscall(pending->syscall_nr)) {
+            if (last) {
+                last->next = pending->next;
+            } else {
+                qrr_full_pending_head = pending->next;
+            }
+            pending->next = NULL;
+            break;
+        }
+        last = pending;
+        pending = pending->next;
+    }
+    if (!pending) {
+        return false;
+    }
+    if (qrr_full_table_fp) {
+        fprintf(qrr_full_table_fp,
+                "%016" PRIx64 "\t%016" PRIx64 "\t%016" PRIx64
+                "\t%d\t%" PRIu64 "\t0\t%d\t-\t%016" PRIx64 "\n",
+                pending->key, pending->path_hash, pending->dep_hash,
+                pending->syscall_nr, pending->sequence,
+                QRR_FULL_RESULT_OUT_ARG_EXEC_TERMINATE,
+                pending->process_token);
+    }
+    qrr_full_schedule_commit(pending);
+    qrr_full_event(pending, 0, 0,
+                   QRR_FULL_RESULT_OUT_ARG_EXEC_TERMINATE, 0,
+                   "record", "exec_terminal_exit");
+    fprintf(stderr,
+            "qrr-full: terminal exec process=%016" PRIx64
+            " sequence=%" PRIu64 " task=" TARGET_FMT_lx
+            " source_pgd=" TARGET_FMT_lx "\n",
+            pending->process_token, pending->sequence, task, source_pgd);
+    free(pending->open_path);
+    free(pending);
+    return true;
 }
 
 static QrrFullPending *qrr_full_pending_find_pgd(target_ulong pgd)
@@ -6542,6 +7010,13 @@ static void qrr_full_record_signal_delivery(CPUState *cpu,
         fprintf(stderr, "qrr-full: cannot flush signal event: %s\n",
                 strerror(errno));
         exit(2);
+    }
+    if (!pending) {
+        qrr_full_user_precision_add(
+            call->pgd, edge_from_pc, edge_to_pc, delay_slot,
+            state->syscall_seq,
+            qrr_full_user_edge_current_occurrence(
+                call->pgd, edge_from_pc, edge_to_pc));
     }
     fprintf(stderr,
             "qrr-full: signal process=%016" PRIx64 " event=%" PRIu64
