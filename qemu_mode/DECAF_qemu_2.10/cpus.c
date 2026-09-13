@@ -80,6 +80,13 @@ static bool qrr_capture_requested(void)
            (event_path && event_path[0]) ||
            (exec_path && exec_path[0]);
 }
+
+static bool qrr_fuzz_feed_requested(void)
+{
+    const char *value = getenv("QRR_FULL_TCG_ENABLE_FUZZ_FEED");
+
+    return value && strcmp(value, "1") == 0;
+}
 #endif
 
 #ifdef CONFIG_LINUX
@@ -2260,7 +2267,13 @@ gotPipeNotification(void *ctx)
 void qemu_init_vcpu(CPUState *cpu)
 {
 #if defined(FUZZ) || defined(MEM_MAPPING) 
-    if (!qrr_capture_requested()) {
+    /* AFL's direct forkserver path still needs the FirmAFL target metadata
+     * (program id, feed type and termination rules), even when the runner
+     * also asks QRR to emit auxiliary tables.  Keep the historical skip for
+     * ordinary capture, but parse the config for the explicit AFL path. */
+    if (!qrr_capture_requested() || qrr_fuzz_feed_requested() ||
+        getenv("QRR_FUZZ_DIRECT_FORKSERVER") ||
+        getenv("QRR_FUZZ_LEGACY_FORKSERVER")) {
         FirmAFL_config();
     }
 #endif
@@ -2276,7 +2289,8 @@ void qemu_init_vcpu(CPUState *cpu)
 #endif
 
 #ifdef FUZZ   
-    if (!qrr_capture_requested()) {
+    if (!qrr_capture_requested() || qrr_fuzz_feed_requested() ||
+        getenv("QRR_FUZZ_LEGACY_FORKSERVER")) {
         if(pipe(afl_qemuloop_pipe) == -1) {
             perror("qemuloop pipe");
             exit(1);

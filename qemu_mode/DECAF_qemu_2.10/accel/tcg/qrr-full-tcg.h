@@ -21,6 +21,10 @@ typedef struct QrrFullOpenHow {
 #define QRR_FULL_RESULT_MAGIC "QEMU_RESULT_REPLAY\t1\tqemu-result-replay-v13"
 #define QRR_FULL_RESULT_COLUMNS \
     "key\tpath_hash\tdep_hash\tsyscall_nr\tsequence\tret\tout_arg\tout_hex\tprocess_token"
+#define QRR_FULL_SCHEDULE_MAGIC \
+    "QEMU_RESULT_SCHEDULE\t1\tqemu-result-schedule-v1"
+#define QRR_FULL_SCHEDULE_COLUMNS \
+    "global_sequence\tprocess_token\tsyscall_sequence\tsyscall_nr\tkey\tpath_hash\tdep_hash"
 #define QRR_FULL_EVENT_MAGIC \
     "QEMU_FULL_TCG_SYSCALL\t1\tqemu-full-tcg-syscall-v1"
 #define QRR_FULL_EVENT_COLUMNS \
@@ -30,9 +34,9 @@ typedef struct QrrFullOpenHow {
 #define QRR_FULL_EXEC_COLUMNS \
     "sequence\tpgd\tentry_pc\tsyscall_nr\targc\tfilename_hex\targv_nul_hex\tcwd_hex\tstatus\treason"
 #define QRR_FULL_SIGNAL_MAGIC \
-    "QEMU_RESULT_SIGNAL\t3\tqemu-result-signal-v3"
+    "QEMU_RESULT_SIGNAL\t4\tqemu-result-signal-v4"
 #define QRR_FULL_SIGNAL_COLUMNS \
-    "process_token\tevent_sequence\tanchor_kind\tsyscall_key\tsyscall_sequence\tsyscall_nr\tpath_hash\tdep_hash\tedge_from_pc\tedge_to_pc\tedge_occurrence\tinterrupted_pc\tinterrupted_sp\tsigno\tsi_code\tsi_errno\tsi_pid\tsi_uid\tsi_status\tsi_value\tfault_addr"
+    "process_token\tevent_sequence\tanchor_kind\tsyscall_key\tsyscall_sequence\tsyscall_nr\tpath_hash\tdep_hash\tedge_from_pc\tedge_to_pc\tedge_occurrence\tdelivery_pc\tinterrupted_pc\tinterrupted_sp\tdelay_slot\tsigno\tsi_code\tsi_errno\tsi_pid\tsi_uid\tsi_status\tsi_value\tfault_addr"
 #define QRR_FULL_LAYOUT_MAGIC \
     "QEMU_RESULT_LAYOUT\t1\tqemu-result-layout-v3"
 #define QRR_FULL_LAYOUT_COLUMNS \
@@ -78,6 +82,13 @@ typedef struct QrrFullOpenHow {
 #define QRR_FULL_TARGET_SEMBUF_SIZE 6
 #define QRR_FULL_MIPS_SEMID64_DS_SIZE (14 * TARGET_LONG_SIZE)
 #define QRR_FULL_TARGET_SEMINFO_SIZE (10 * QRR_FULL_ABI_INT_SIZE)
+#define QRR_FULL_TARGET_WAIT_STATUS_SIZE QRR_FULL_ABI_INT_SIZE
+#define QRR_FULL_TARGET_RUSAGE_SIZE (18 * TARGET_LONG_SIZE)
+/* Linux UAPI struct sysinfo is 64 bytes for the MIPS/ARM 32-bit ABIs used
+ * by the firmware corpus.  Keep the expression ABI-sized so a future
+ * 64-bit collector gets the corresponding 104-byte layout. */
+#define QRR_FULL_TARGET_SYSINFO_SIZE (10 * TARGET_LONG_SIZE + 24)
+#define QRR_FULL_TARGET_IFREQ_SIZE (TARGET_LONG_SIZE == 8 ? 40 : 32)
 #define QRR_FULL_QEMU_ESIGRETURN 513
 #define QRR_FULL_ABI_LONG_SIZE ((size_t)TARGET_LONG_SIZE)
 #define QRR_FULL_ABI_INT_SIZE 4
@@ -122,6 +133,10 @@ typedef struct QrrFullPathState {
     bool have_previous_tb;
     target_ulong previous_user_edge_pc;
     bool have_previous_user_edge_pc;
+    bool have_interrupted_user_edge;
+    target_ulong interrupted_edge_from_pc;
+    target_ulong interrupted_tb_pc;
+    target_ulong interrupted_next_pc;
     uint64_t syscall_site_tail[QRR_FULL_PATH_TAIL_LENGTH];
     unsigned int syscall_site_tail_count;
     unsigned int syscall_site_tail_next;
@@ -153,8 +168,21 @@ typedef struct QrrFullTbPending {
 typedef struct QrrFullTargetPgd {
     target_ulong pgd;
     uint64_t process_token;
+    target_ulong task;
+    bool have_task;
     struct QrrFullTargetPgd *next;
 } QrrFullTargetPgd;
+
+typedef struct QrrFullScheduleEvent {
+    uint64_t process_token;
+    uint64_t syscall_sequence;
+    int syscall_nr;
+    uint64_t key;
+    uint64_t path_hash;
+    uint64_t dep_hash;
+    bool committed;
+    struct QrrFullScheduleEvent *next;
+} QrrFullScheduleEvent;
 
 typedef struct QrrFullPending {
     target_ulong pgd;
@@ -165,12 +193,19 @@ typedef struct QrrFullPending {
     uint64_t path_hash;
     uint64_t dep_hash;
     uint64_t sequence;
+    /* One QRR row describes one logical syscall.  A signal may make Linux
+     * execute the same user syscall instruction again before this pending
+     * operation returns.  Those entries are attempts of this identity, not
+     * new syscalls, and therefore must not advance the path/sequence state. */
+    uint64_t logical_syscall_id;
+    uint64_t attempt_count;
     uint64_t process_token;
     target_ulong args[6];
     char *open_path;
     target_ulong semaphore_array;
     uint32_t *semaphore_values;
     size_t semaphore_nsems;
+    QrrFullScheduleEvent *schedule_event;
     struct QrrFullPending *next;
 } QrrFullPending;
 
@@ -181,15 +216,19 @@ typedef struct QrrFullFdPath {
     struct QrrFullFdPath *next;
 } QrrFullFdPath;
 
+struct QrrFullMmapMapping;
+
 typedef struct QrrFullForkPending {
     CPUState *cpu;
     target_ulong source_pgd;
+    target_ulong source_task;
     target_ulong entry_pc;
     target_ulong stack;
     uint64_t child_process_token;
     bool have_path_state;
     QrrFullPathState path_state;
     QrrFullFdPath *fd_paths;
+    struct QrrFullMmapMapping *mmap_mappings;
     struct QrrFullForkPending *next;
 } QrrFullForkPending;
 
@@ -305,15 +344,19 @@ typedef struct QrrFullPageFaultCall {
 static int qrr_full_initialized;
 static bool qrr_full_enabled;
 static bool qrr_full_all_pgds;
+static bool qrr_full_follow_fork_descendants;
 static const char *qrr_full_target_name;
 static size_t qrr_full_max_blob = QRR_FULL_DEFAULT_MAX_BLOB;
 static FILE *qrr_full_table_fp;
+static FILE *qrr_full_schedule_fp;
 static FILE *qrr_full_event_fp;
 static FILE *qrr_full_exec_fp;
 static FILE *qrr_full_signal_fp;
 static FILE *qrr_full_layout_fp;
 static FILE *qrr_full_mmap_fp;
 static uint64_t qrr_full_exec_sequence;
+static QrrFullScheduleEvent *qrr_full_schedule_head;
+static QrrFullScheduleEvent *qrr_full_schedule_tail;
 static QrrFullPathState *qrr_full_paths;
 static QrrFullTargetPgd *qrr_full_target_pgds;
 static QrrFullPending *qrr_full_pending_head;
@@ -337,6 +380,8 @@ static target_ulong qrr_full_get_signal_to_deliver;
 static target_ulong qrr_full_do_signal;
 static target_ulong qrr_full_do_notify_resume;
 static target_ulong qrr_full_proc_exec_connector;
+static target_ulong qrr_full_proc_exit_connector;
+static target_ulong qrr_full_proc_fork_connector;
 static target_ulong qrr_full_init_task;
 static target_ulong qrr_full_pgd_current;
 static target_ulong qrr_full_ipc_lock_check;
@@ -346,6 +391,11 @@ static target_ulong qrr_full_handle_mm_fault;
 static char *qrr_full_hex_from_bytes(const unsigned char *bytes,
                                      size_t length);
 static void qrr_full_remove_exec_pending(QrrFullExecPending *pending);
+static void qrr_full_complete_exec_transition(QrrFullExecPending *pending,
+                                              target_ulong pgd,
+                                              const char *completion);
+static void qrr_full_note_current_target_task(CPUState *cpu,
+                                              target_ulong pgd);
 static target_ulong qrr_full_sem_array_base_offset;
 static target_ulong qrr_full_sem_array_nsems_offset;
 static target_ulong qrr_full_sem_size;
@@ -420,10 +470,11 @@ static bool qrr_full_resolve_kernel_symbols(const char *path,
 {
     static const char *names[] = {
         "get_signal_to_deliver", "do_signal", "do_notify_resume",
-        "proc_exec_connector", "init_task", "pgd_current",
-        "ipc_lock_check", "do_page_fault", "handle_mm_fault"
+        "proc_exec_connector", "proc_exit_connector", "init_task",
+        "pgd_current", "ipc_lock_check", "do_page_fault",
+        "handle_mm_fault", "proc_fork_connector"
     };
-    target_ulong values[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    target_ulong values[11] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     Elf32_Ehdr ehdr;
     FILE *fp = NULL;
     bool swap;
@@ -543,21 +594,25 @@ static bool qrr_full_resolve_kernel_symbols(const char *path,
         free(strings);
     }
     if (!values[3] || !values[4] || !values[5] || !values[6] ||
-        !values[7] || !values[8] ||
+        !values[7] || !values[8] || !values[9] ||
+        (qrr_full_follow_fork_descendants && !values[10]) ||
         (need_signals && (!values[0] || !values[1] || !values[2]))) {
         fprintf(stderr,
                 "qrr-full: required kernel symbols missing in %s"
                 " (get_signal_to_deliver=%" PRIx64
                 " do_signal=%" PRIx64 " do_notify_resume=%" PRIx64
-                " proc_exec_connector=%" PRIx64 " init_task=%" PRIx64
+                " proc_exec_connector=%" PRIx64
+                " proc_exit_connector=%" PRIx64 " init_task=%" PRIx64
                 " pgd_current=%" PRIx64 " ipc_lock_check=%" PRIx64
                 " do_page_fault=%" PRIx64 " handle_mm_fault=%" PRIx64
+                " proc_fork_connector=%" PRIx64
                 ")\n",
                 path, (uint64_t)values[0], (uint64_t)values[1],
                 (uint64_t)values[2], (uint64_t)values[3],
                 (uint64_t)values[4], (uint64_t)values[5],
                 (uint64_t)values[6], (uint64_t)values[7],
-                (uint64_t)values[8]);
+                (uint64_t)values[8], (uint64_t)values[9],
+                (uint64_t)values[10]);
         goto out;
     }
     if (need_signals) {
@@ -566,25 +621,31 @@ static bool qrr_full_resolve_kernel_symbols(const char *path,
         qrr_full_do_notify_resume = values[2];
     }
     qrr_full_proc_exec_connector = values[3];
-    qrr_full_init_task = values[4];
-    qrr_full_pgd_current = values[5];
-    qrr_full_ipc_lock_check = values[6];
-    qrr_full_do_page_fault = values[7];
-    qrr_full_handle_mm_fault = values[8];
+    qrr_full_proc_exit_connector = values[4];
+    qrr_full_init_task = values[5];
+    qrr_full_pgd_current = values[6];
+    qrr_full_ipc_lock_check = values[7];
+    qrr_full_do_page_fault = values[8];
+    qrr_full_handle_mm_fault = values[9];
+    qrr_full_proc_fork_connector = values[10];
     fprintf(stderr,
             "qrr-full: kernel symbols proc_exec_connector=" TARGET_FMT_lx
+            " proc_exit_connector=" TARGET_FMT_lx
             " init_task=" TARGET_FMT_lx " pgd_current=" TARGET_FMT_lx
             " get_signal_to_deliver=" TARGET_FMT_lx
             " do_signal=" TARGET_FMT_lx " do_notify_resume=" TARGET_FMT_lx
             " ipc_lock_check=" TARGET_FMT_lx
             " do_page_fault=" TARGET_FMT_lx
             " handle_mm_fault=" TARGET_FMT_lx
+            " proc_fork_connector=" TARGET_FMT_lx
             " source=%s\n",
-            qrr_full_proc_exec_connector, qrr_full_init_task,
+            qrr_full_proc_exec_connector, qrr_full_proc_exit_connector,
+            qrr_full_init_task,
             qrr_full_pgd_current,
             qrr_full_get_signal_to_deliver, qrr_full_do_signal,
             qrr_full_do_notify_resume, qrr_full_ipc_lock_check,
-            qrr_full_do_page_fault, qrr_full_handle_mm_fault, path);
+            qrr_full_do_page_fault, qrr_full_handle_mm_fault,
+            qrr_full_proc_fork_connector, path);
     ok = true;
 out:
     fclose(fp);
@@ -765,6 +826,76 @@ static bool qrr_full_load_semaphore_profile(const char *path,
     return true;
 }
 
+static void qrr_full_flush_schedule(void)
+{
+    QrrFullScheduleEvent *event = qrr_full_schedule_head;
+    uint64_t output_sequence = 0;
+
+    while (event) {
+        QrrFullScheduleEvent *next = event->next;
+
+        if (event->committed && qrr_full_schedule_fp) {
+            output_sequence++;
+            if (fprintf(qrr_full_schedule_fp,
+                        "%" PRIu64 "\t%016" PRIx64 "\t%" PRIu64
+                        "\t%d\t%016" PRIx64 "\t%016" PRIx64
+                        "\t%016" PRIx64 "\n",
+                        output_sequence, event->process_token,
+                        event->syscall_sequence, event->syscall_nr,
+                        event->key, event->path_hash, event->dep_hash) < 0) {
+                fprintf(stderr,
+                        "qrr-full: cannot write committed syscall schedule: %s\n",
+                        strerror(errno));
+                exit(2);
+            }
+        }
+        free(event);
+        event = next;
+    }
+    qrr_full_schedule_head = NULL;
+    qrr_full_schedule_tail = NULL;
+    if (qrr_full_schedule_fp && fflush(qrr_full_schedule_fp) != 0) {
+        fprintf(stderr,
+                "qrr-full: cannot flush committed syscall schedule: %s\n",
+                strerror(errno));
+        exit(2);
+    }
+}
+
+static void qrr_full_schedule_entry(QrrFullPending *pending)
+{
+    QrrFullScheduleEvent *event;
+
+    if (!qrr_full_schedule_fp) {
+        return;
+    }
+    event = calloc(1, sizeof(*event));
+    if (!event) {
+        fprintf(stderr, "qrr-full: cannot allocate syscall schedule event\n");
+        exit(2);
+    }
+    event->process_token = pending->process_token;
+    event->syscall_sequence = pending->sequence;
+    event->syscall_nr = pending->syscall_nr;
+    event->key = pending->key;
+    event->path_hash = pending->path_hash;
+    event->dep_hash = pending->dep_hash;
+    if (qrr_full_schedule_tail) {
+        qrr_full_schedule_tail->next = event;
+    } else {
+        qrr_full_schedule_head = event;
+    }
+    qrr_full_schedule_tail = event;
+    pending->schedule_event = event;
+}
+
+static void qrr_full_schedule_commit(QrrFullPending *pending)
+{
+    if (pending && pending->schedule_event) {
+        pending->schedule_event->committed = true;
+    }
+}
+
 static void qrr_full_close(void)
 {
     while (qrr_full_tb_pending) {
@@ -776,6 +907,13 @@ static void qrr_full_close(void)
     if (qrr_full_table_fp) {
         fclose(qrr_full_table_fp);
         qrr_full_table_fp = NULL;
+    }
+    if (qrr_full_schedule_fp) {
+        qrr_full_flush_schedule();
+        fclose(qrr_full_schedule_fp);
+        qrr_full_schedule_fp = NULL;
+    } else {
+        qrr_full_flush_schedule();
     }
     if (qrr_full_event_fp) {
         fclose(qrr_full_event_fp);
@@ -802,6 +940,7 @@ static void qrr_full_close(void)
 static bool qrr_full_init(void)
 {
     const char *table_path;
+    const char *schedule_path;
     const char *event_path;
     const char *exec_path;
     const char *max_blob;
@@ -813,6 +952,7 @@ static bool qrr_full_init(void)
     const char *layout_path;
     const char *mmap_path;
     const char *procinfo_path;
+    const char *fork_descendants;
     bool collection_requested;
     char profile_error[128];
 
@@ -821,6 +961,7 @@ static bool qrr_full_init(void)
     }
     qrr_full_initialized = 1;
     table_path = getenv("QRR_FULL_TCG_QRR");
+    schedule_path = getenv("QRR_FULL_TCG_SCHEDULE");
     event_path = getenv("QRR_FULL_TCG_EVENTS");
     exec_path = getenv("QRR_FULL_TCG_EXECS");
     max_blob = getenv("QRR_FULL_TCG_MAX_BLOB");
@@ -832,14 +973,25 @@ static bool qrr_full_init(void)
     layout_path = getenv("QRR_FULL_TCG_LAYOUT");
     mmap_path = getenv("QRR_FULL_TCG_MMAPS");
     procinfo_path = getenv("QRR_FULL_TCG_PROCINFO");
+    fork_descendants = getenv("QRR_FULL_TCG_FORK_DESCENDANTS");
     collection_requested =
-        (table_path && table_path[0]) || (event_path && event_path[0]) ||
+        (table_path && table_path[0]) ||
+        (schedule_path && schedule_path[0]) ||
+        (event_path && event_path[0]) ||
         (exec_path && exec_path[0]) || (signal_path && signal_path[0]) ||
         (layout_path && layout_path[0]) || (mmap_path && mmap_path[0]);
     if (max_blob && max_blob[0]) {
         qrr_full_max_blob = strtoull(max_blob, NULL, 0);
     }
     qrr_full_all_pgds = all_pgds && strcmp(all_pgds, "1") == 0;
+    if (fork_descendants && strcmp(fork_descendants, "0") != 0 &&
+        strcmp(fork_descendants, "1") != 0) {
+        fprintf(stderr,
+                "qrr-full: QRR_FULL_TCG_FORK_DESCENDANTS must be 0 or 1\n");
+        exit(2);
+    }
+    qrr_full_follow_fork_descendants =
+        fork_descendants && strcmp(fork_descendants, "1") == 0;
     qrr_full_target_name = target_name && target_name[0] ? target_name : NULL;
     if (collection_requested) {
         if (!qrr_full_target_name) {
@@ -918,6 +1070,37 @@ static bool qrr_full_init(void)
             setvbuf(qrr_full_table_fp, NULL, _IOLBF, 0);
             qrr_full_enabled = true;
         }
+    }
+    if (schedule_path && schedule_path[0]) {
+        qrr_full_schedule_fp = fopen(schedule_path, "a+");
+        if (!qrr_full_schedule_fp) {
+            fprintf(stderr, "qrr-full: cannot create schedule table %s: %s\n",
+                    schedule_path, strerror(errno));
+            exit(2);
+        }
+        if (setvbuf(qrr_full_schedule_fp, NULL, _IOLBF, 0) != 0) {
+            fprintf(stderr,
+                    "qrr-full: cannot set schedule table buffering: %s\n",
+                    strerror(errno));
+            exit(2);
+        }
+        fseek(qrr_full_schedule_fp, 0, SEEK_END);
+        if (ftell(qrr_full_schedule_fp) == 0) {
+            fprintf(qrr_full_schedule_fp, "%s\n", QRR_FULL_SCHEDULE_MAGIC);
+            fprintf(qrr_full_schedule_fp, "%s\n", QRR_FULL_SCHEDULE_COLUMNS);
+        } else {
+            fprintf(stderr,
+                    "qrr-full: schedule output must be a fresh file: %s\n",
+                    schedule_path);
+            exit(2);
+        }
+        if (fflush(qrr_full_schedule_fp) != 0) {
+            fprintf(stderr,
+                    "qrr-full: cannot flush schedule table header: %s\n",
+                    strerror(errno));
+            exit(2);
+        }
+        qrr_full_enabled = true;
     }
     if (event_path && event_path[0]) {
         qrr_full_event_fp = fopen(event_path, "a+");
@@ -1066,7 +1249,23 @@ static bool qrr_full_user_pc(target_ulong pc)
 
 static bool qrr_full_trace_pgd(target_ulong pgd)
 {
-    return qrr_full_target_active && pgd == qrr_full_selected_pgd;
+    QrrFullTargetPgd *target;
+
+    if (!qrr_full_target_active) {
+        return false;
+    }
+    if (!qrr_full_follow_fork_descendants) {
+        return pgd == qrr_full_selected_pgd;
+    }
+    /* Descendant discovery happens only at the exact fork return anchor.
+     * The hot TB path therefore checks this small bound-target list and does
+     * not invoke WMI or scan the guest process table. */
+    for (target = qrr_full_target_pgds; target; target = target->next) {
+        if (target->pgd == pgd) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static QrrFullTargetPgd *qrr_full_target_process(target_ulong pgd)
@@ -1275,12 +1474,14 @@ static void qrr_full_bind_process_token(target_ulong pgd,
     target = qrr_full_target_process(pgd);
     if (target) {
         target->process_token = process_token;
+        target->task = 0;
+        target->have_task = false;
         if (reset_path) {
             qrr_full_reset_path_context(pgd, process_token);
         }
         return;
     }
-    target = malloc(sizeof(*target));
+    target = calloc(1, sizeof(*target));
     if (!target) {
         return;
     }
@@ -1310,6 +1511,40 @@ static uint64_t qrr_full_bind_new_target_exec(target_ulong pgd)
 static target_ulong qrr_full_exec_connector_address(void)
 {
     return qrr_full_init() ? qrr_full_proc_exec_connector : 0;
+}
+
+static target_ulong qrr_full_exit_connector_address(void)
+{
+    return qrr_full_init() ? qrr_full_proc_exit_connector : 0;
+}
+
+static target_ulong qrr_full_fork_connector_address(void)
+{
+    return qrr_full_init() && qrr_full_follow_fork_descendants ?
+        qrr_full_proc_fork_connector : 0;
+}
+
+static void qrr_full_note_exit_connector(target_ulong task)
+{
+    QrrFullTargetPgd *target;
+
+    if (!qrr_full_init() || !qrr_full_follow_fork_descendants || !task) {
+        return;
+    }
+    for (target = qrr_full_target_pgds; target; target = target->next) {
+        if (target->have_task && target->task == task) {
+            target_ulong pgd = target->pgd;
+            uint64_t process_token = target->process_token;
+
+            fprintf(stderr,
+                    "qrr-full: exact target process exit task="
+                    TARGET_FMT_lx " pgd=" TARGET_FMT_lx
+                    " process=%016" PRIx64 "\n",
+                    task, pgd, process_token);
+            qrr_full_unbind_process(pgd, "proc-exit-connector");
+            return;
+        }
+    }
 }
 
 /* QRR resolves pgd_current from the exact configured vmlinux.  This avoids
@@ -1437,13 +1672,15 @@ static void qrr_full_record_exec_launch(CPUState *cpu,
 
 /* Called only from the optimized proc_exec_connector TB hook.  The first
  * successful exec whose exact task comm matches the configured target owns
- * collection for the lifetime of this run.  Fork children and later target
- * executions deliberately do not acquire another PGD. */
+ * the root process token.  Later same-name execs do not independently acquire
+ * a token; fork descendants are attached only by the exact
+ * proc_fork_connector lifecycle hook. */
 static void qrr_full_note_exec_connector(CPUState *cpu,
                                          target_ulong task)
 {
     qrr_vmi_exec_identity_t identity;
     QrrFullExecPending *exec_pending;
+    QrrFullTargetPgd *bound_process;
     char error[128];
     uint64_t process_token;
 
@@ -1463,18 +1700,49 @@ static void qrr_full_note_exec_connector(CPUState *cpu,
     }
     exec_pending = qrr_full_exec_pending_for_task(task);
     if (qrr_full_target_locked) {
-        if (identity.pgd == qrr_full_selected_pgd &&
-            strcmp(identity.name, qrr_full_target_name) != 0) {
-            fprintf(stderr,
-                    "qrr-full: selected process exec changed identity"
-                    " pgd=" TARGET_FMT_lx " task=" TARGET_FMT_lx
-                    " name=%s; collection stopped\n",
-                    identity.pgd, identity.task, identity.name);
-            qrr_full_target_active = false;
-            qrr_full_unbind_process(identity.pgd, identity.name);
-            qrr_full_selected_task = 0;
-        } else if (identity.pgd != qrr_full_selected_pgd &&
-                   strcmp(identity.name, qrr_full_target_name) == 0) {
+        bound_process = qrr_full_target_process(identity.pgd);
+        if (bound_process) {
+            if (!exec_pending) {
+                if (strcmp(identity.name, qrr_full_target_name) != 0) {
+                    /* Linux may reuse a dead descendant's physical PGD for
+                     * an unrelated process before a userspace exit syscall
+                     * was observable.  The exact connector task has no exec
+                     * entry belonging to the bound execution, proving this
+                     * is stale PGD ownership rather than a target exec. */
+                    fprintf(stderr,
+                            "qrr-full: proc_exec_connector proved stale"
+                            " target PGD reuse pgd=" TARGET_FMT_lx
+                            " process=%016" PRIx64 " task=" TARGET_FMT_lx
+                            " new_name=%s; unbinding\n",
+                            identity.pgd, bound_process->process_token,
+                            identity.task, identity.name);
+                    qrr_full_unbind_process(identity.pgd,
+                                            "exec-pgd-reuse");
+                    return;
+                }
+                fprintf(stderr,
+                        "qrr-full: bound process successful exec has no"
+                        " exact filename/argv/task association"
+                        " pgd=" TARGET_FMT_lx " task=" TARGET_FMT_lx
+                        " name=%s\n",
+                        identity.pgd, identity.task, identity.name);
+                exit(2);
+            }
+            /* proc_exec_connector is the authoritative successful-exec
+             * event.  Its exact task identity decides whether this execution
+             * remains the configured target; filename matching is used only
+             * to associate the entry-side argv record. */
+            exec_pending->target_match =
+                strcmp(identity.name, qrr_full_target_name) == 0;
+            if (identity.pgd == qrr_full_selected_pgd) {
+                qrr_full_selected_task = exec_pending->target_match ?
+                    identity.task : 0;
+            }
+            qrr_full_complete_exec_transition(
+                exec_pending, identity.pgd, "proc_exec_connector");
+            return;
+        }
+        if (strcmp(identity.name, qrr_full_target_name) == 0) {
             fprintf(stderr,
                     "qrr-full: ignored additional target execution"
                     " name=%s pid=%" PRIu32 " pgd=" TARGET_FMT_lx
@@ -1482,6 +1750,7 @@ static void qrr_full_note_exec_connector(CPUState *cpu,
                     identity.name, identity.pid, identity.pgd,
                     qrr_full_selected_pgd);
         }
+        /* The process was never in the selected fork family. */
         if (exec_pending) {
             qrr_full_remove_exec_pending(exec_pending);
         }
@@ -1511,6 +1780,13 @@ static void qrr_full_note_exec_connector(CPUState *cpu,
     qrr_full_selected_pgd = identity.pgd;
     qrr_full_selected_task = identity.task;
     process_token = qrr_full_bind_new_target_exec(identity.pgd);
+    bound_process = qrr_full_target_process(identity.pgd);
+    if (!bound_process) {
+        fprintf(stderr, "qrr-full: selected target binding disappeared\n");
+        exit(2);
+    }
+    bound_process->task = identity.task;
+    bound_process->have_task = true;
     qrr_full_request_initial_layout(process_token);
     fprintf(stderr,
             "qrr-full: selected target from proc_exec_connector"
@@ -1565,6 +1841,107 @@ static void qrr_full_note_process_identity(target_ulong pgd,
     }
 }
 
+static void qrr_full_free_mmap_mapping(QrrFullMmapMapping *mapping)
+{
+    QrrFullMmapPage *page;
+
+    if (!mapping) {
+        return;
+    }
+    page = mapping->pages;
+    while (page) {
+        QrrFullMmapPage *next = page->next;
+
+        free(page);
+        page = next;
+    }
+    free(mapping->path);
+    free(mapping);
+}
+
+static void qrr_full_mmap_remove_all(target_ulong pgd)
+{
+    QrrFullMmapMapping **link = &qrr_full_mmap_mappings;
+
+    while (*link) {
+        QrrFullMmapMapping *mapping = *link;
+
+        if (mapping->pgd == pgd) {
+            *link = mapping->next;
+            qrr_full_free_mmap_mapping(mapping);
+            continue;
+        }
+        link = &mapping->next;
+    }
+}
+
+static void qrr_full_pending_remove_all(target_ulong pgd)
+{
+    QrrFullSemaphoreLockCall **semaphore_link =
+        &qrr_full_semaphore_lock_calls;
+    QrrFullSignalCall **signal_link = &qrr_full_signal_calls;
+    QrrFullPageFaultCall **fault_link = &qrr_full_page_fault_calls;
+    QrrFullPending **pending_link = &qrr_full_pending_head;
+
+    while (*semaphore_link) {
+        QrrFullSemaphoreLockCall *call = *semaphore_link;
+
+        if (call->pgd == pgd) {
+            *semaphore_link = call->next;
+            free(call);
+            continue;
+        }
+        semaphore_link = &call->next;
+    }
+    while (*signal_link) {
+        QrrFullSignalCall *call = *signal_link;
+
+        if (call->pgd == pgd) {
+            *signal_link = call->next;
+            free(call);
+            continue;
+        }
+        signal_link = &call->next;
+    }
+    while (*fault_link) {
+        QrrFullPageFaultCall *call = *fault_link;
+
+        if (call->pgd == pgd) {
+            *fault_link = call->next;
+            free(call);
+            continue;
+        }
+        fault_link = &call->next;
+    }
+    while (*pending_link) {
+        QrrFullPending *pending = *pending_link;
+
+        if (pending->pgd == pgd) {
+            *pending_link = pending->next;
+            free(pending->open_path);
+            free(pending->semaphore_values);
+            free(pending);
+            continue;
+        }
+        pending_link = &pending->next;
+    }
+}
+
+static void qrr_full_exec_pending_remove_all(target_ulong pgd)
+{
+    QrrFullExecPending *pending;
+
+    do {
+        pending = qrr_full_exec_pending;
+        while (pending && pending->pgd != pgd) {
+            pending = pending->next;
+        }
+        if (pending) {
+            qrr_full_remove_exec_pending(pending);
+        }
+    } while (pending);
+}
+
 static void qrr_full_unbind_process(target_ulong pgd, const char *process_name)
 {
     QrrFullTargetPgd *target = qrr_full_target_pgds;
@@ -1601,10 +1978,14 @@ static void qrr_full_unbind_process(target_ulong pgd, const char *process_name)
             link = &state->next;
         }
     }
+    qrr_full_pending_remove_all(pgd);
+    qrr_full_exec_pending_remove_all(pgd);
     qrr_full_fd_remove_all(pgd);
+    qrr_full_mmap_remove_all(pgd);
     qrr_full_user_edge_remove_all(pgd);
     qrr_full_tb_pending_remove_pgd(pgd);
-    if (pgd == qrr_full_selected_pgd) {
+    if (pgd == qrr_full_selected_pgd &&
+        !qrr_full_follow_fork_descendants) {
         qrr_full_target_active = false;
     }
 }
@@ -1666,6 +2047,7 @@ static void qrr_full_track_target_exec_in_kernel(CPUState *cpu)
     target_ulong kernel_sp;
     target_ulong thread_info;
     target_ulong task;
+    target_ulong pgd;
     char error[128];
 
     kernel_sp = env->active_tc.gpr[29];
@@ -1673,16 +2055,18 @@ static void qrr_full_track_target_exec_in_kernel(CPUState *cpu)
         return;
     }
     thread_info = kernel_sp & ~(QRR_FULL_MIPS_THREAD_SIZE - 1);
+    pgd = qrr_full_current_pgd(cpu);
     qrr_full_last_kernel_thread_info = thread_info;
     qrr_full_have_last_kernel_thread_info = true;
     for (pending = qrr_full_exec_pending; pending; pending = pending->next) {
-        if (pending->cpu == cpu && pending->have_thread_info &&
-            pending->thread_info == thread_info) {
+        if (pending->cpu == cpu && pending->pgd == pgd &&
+            pending->have_thread_info && pending->thread_info == thread_info) {
             return;
         }
     }
     for (pending = qrr_full_exec_pending; pending; pending = pending->next) {
-        if (pending->cpu == cpu && !pending->have_thread_info) {
+        if (pending->cpu == cpu && pending->pgd == pgd &&
+            !pending->have_thread_info) {
             if (VMI_qrr_task_from_thread_info_c(
                     cpu, thread_info, &task, error, sizeof(error)) != 0) {
                 fprintf(stderr,
@@ -1695,6 +2079,23 @@ static void qrr_full_track_target_exec_in_kernel(CPUState *cpu)
             pending->have_thread_info = true;
             pending->task = task;
             pending->have_task = true;
+            {
+                QrrFullTargetPgd *target = qrr_full_target_process(pgd);
+
+                if (target) {
+                    if (target->have_task && target->task != task) {
+                        fprintf(stderr,
+                                "qrr-full: exec task changed within target"
+                                " PGD pgd=" TARGET_FMT_lx
+                                " old_task=" TARGET_FMT_lx
+                                " new_task=" TARGET_FMT_lx "\n",
+                                pgd, target->task, task);
+                        exit(2);
+                    }
+                    target->task = task;
+                    target->have_task = true;
+                }
+            }
             fprintf(stderr,
                     "qrr-full: exec pending thread_info=" TARGET_FMT_lx
                     " task=" TARGET_FMT_lx " source_pgd=" TARGET_FMT_lx
@@ -1707,19 +2108,77 @@ static void qrr_full_track_target_exec_in_kernel(CPUState *cpu)
 #endif
 }
 
+static void qrr_full_note_current_target_task(CPUState *cpu,
+                                              target_ulong pgd)
+{
+#ifdef TARGET_MIPS
+    CPUArchState *env = cpu->env_ptr;
+    QrrFullTargetPgd *target = qrr_full_target_process(pgd);
+    qrr_vmi_exec_identity_t identity;
+    target_ulong kernel_sp = env->active_tc.gpr[29];
+    target_ulong thread_info;
+    target_ulong task;
+    char error[128];
+
+    if (!target || kernel_sp < UINT32_C(0x80000000)) {
+        return;
+    }
+    thread_info = kernel_sp & ~(QRR_FULL_MIPS_THREAD_SIZE - 1);
+    if (VMI_qrr_task_from_thread_info_c(
+            cpu, thread_info, &task, error, sizeof(error)) != 0 ||
+        VMI_qrr_read_exec_identity_c(
+            cpu, task, &identity, error, sizeof(error)) != 0 ||
+        identity.pgd != pgd) {
+        /* A kernel thread can temporarily borrow this active_mm.  It is not
+         * an execution identity for the selected userspace process. */
+        return;
+    }
+    if (target->have_task && target->task != task) {
+        fprintf(stderr,
+                "qrr-full: multiple tasks share one target PGD; thread"
+                " isolation is not implemented pgd=" TARGET_FMT_lx
+                " process=%016" PRIx64 " old_task=" TARGET_FMT_lx
+                " new_task=" TARGET_FMT_lx "\n",
+                pgd, target->process_token, target->task, task);
+        exit(2);
+    }
+    target->task = task;
+    target->have_task = true;
+#else
+    (void)cpu;
+    (void)pgd;
+#endif
+}
+
 static void qrr_full_complete_exec_transition(QrrFullExecPending *pending,
                                               target_ulong pgd,
                                               const char *completion)
 {
     target_ulong source_pgd = pending->pgd;
+    target_ulong exec_task = pending->have_task ? pending->task : 0;
     bool target_match = pending->target_match;
     uint64_t next_process_token = 0;
+
+    /* Unbind below also clears every stale exec association for the old mm.
+     * Detach the exact completing record first so it cannot be freed twice. */
+    qrr_full_remove_exec_pending(pending);
 
     if (target_match) {
         if (source_pgd != pgd) {
             qrr_full_clone_process_state(source_pgd, pgd);
         }
         next_process_token = qrr_full_bind_new_target_exec(pgd);
+        if (exec_task) {
+            QrrFullTargetPgd *target = qrr_full_target_process(pgd);
+
+            if (!target) {
+                fprintf(stderr,
+                        "qrr-full: target exec binding disappeared\n");
+                exit(2);
+            }
+            target->task = exec_task;
+            target->have_task = true;
+        }
         if (qrr_full_layout_fp) {
             QrrFullLayoutCaptured *request = calloc(1, sizeof(*request));
 
@@ -1751,7 +2210,6 @@ static void qrr_full_complete_exec_transition(QrrFullExecPending *pending,
                 TARGET_FMT_lx " pgd=" TARGET_FMT_lx "\n",
                 completion, source_pgd, pgd);
     }
-    qrr_full_remove_exec_pending(pending);
 }
 
 static void qrr_full_bind_target_exec_transition(CPUState *cpu,
@@ -1816,6 +2274,9 @@ static void qrr_full_tb_before(CPUState *cpu, TranslationBlock *itb)
     if (!qrr_full_trace_pgd(pgd)) {
         return;
     }
+    if (!qrr_full_user_pc(pc)) {
+        qrr_full_note_current_target_task(cpu, pgd);
+    }
     qrr_full_note_page_fault(cpu, pc);
     qrr_full_note_signal_delivery(cpu, pc);
     qrr_full_note_semaphore_lock(cpu, pc);
@@ -1826,6 +2287,10 @@ static void qrr_full_tb_before(CPUState *cpu, TranslationBlock *itb)
     if (!state) {
         return;
     }
+    /* A delivery decision is made in kernel mode before execution can return
+     * here.  Reaching another user TB proves that an older interrupted-TB
+     * anchor did not produce a delivered signal. */
+    state->have_interrupted_user_edge = false;
 #ifdef TARGET_MIPS
     qrr_full_capture_initial_layout(cpu, pgd, pc,
                                     ((CPUArchState *)cpu->env_ptr)->
@@ -1957,11 +2422,24 @@ static void qrr_full_tb_interrupted(CPUState *cpu, bool state_restored)
 #ifdef TARGET_MIPS
     {
         CPUArchState *env = cpu->env_ptr;
+        QrrFullPathState *state = qrr_full_path_state(pending->pgd, false);
         target_ulong fault_pc = env->active_tc.PC;
         target_ulong tb_end = pending->tb_pc + pending->tb_size;
         target_ulong last_completed_pc;
         unsigned int instruction_size = 4;
         bool delay_slot = (env->hflags & MIPS_HFLAG_BMASK) != 0;
+
+        if (!state || !state->process_token) {
+            fprintf(stderr,
+                    "qrr-full: interrupted user TB lost process state pgd="
+                    TARGET_FMT_lx " pc=" TARGET_FMT_lx "\n",
+                    pending->pgd, fault_pc);
+            exit(2);
+        }
+        state->have_interrupted_user_edge = true;
+        state->interrupted_edge_from_pc = pending->edge_from_pc;
+        state->interrupted_tb_pc = pending->tb_pc;
+        state->interrupted_next_pc = fault_pc;
 
         if (fault_pc == pending->tb_pc) {
             qrr_full_tb_discard(
@@ -2042,6 +2520,7 @@ static void qrr_full_advance_context(QrrFullPathState *state, int syscall_nr,
     state->have_previous_tb = false;
     state->previous_user_edge_pc = 0;
     state->have_previous_user_edge_pc = false;
+    state->have_interrupted_user_edge = false;
     qrr_full_user_edge_remove_all(state->pgd);
 }
 
@@ -2115,6 +2594,30 @@ static bool qrr_full_ioctl_output_length(target_ulong request,
     case 0x7472: /* TIOCOUTQ */
         *length = 4;
         return true;
+    /* Legacy socket ioctls do not encode direction or size in the command.
+     * These exact Linux UAPI commands all copy one complete target ifreq
+     * back to userspace. */
+    case 0x8910: /* SIOCGIFNAME */
+    case 0x8913: /* SIOCGIFFLAGS */
+    case 0x8915: /* SIOCGIFADDR */
+    case 0x8917: /* SIOCGIFDSTADDR */
+    case 0x8919: /* SIOCGIFBRDADDR */
+    case 0x891b: /* SIOCGIFNETMASK */
+    case 0x891d: /* SIOCGIFMETRIC */
+    case 0x891f: /* SIOCGIFMEM */
+    case 0x8921: /* SIOCGIFMTU */
+    case 0x8927: /* SIOCGIFHWADDR */
+    case 0x8929: /* SIOCGIFSLAVE */
+    case 0x8933: /* SIOCGIFINDEX */
+    case 0x8935: /* SIOCGIFPFLAGS */
+    case 0x8942: /* SIOCGIFTXQLEN */
+    case 0x8970: /* SIOCGIFMAP */
+    case 0x8b01: /* SIOCGIWNAME */
+        *length = QRR_FULL_TARGET_IFREQ_SIZE;
+        return true;
+    case 0x8925: /* SIOCGIFENCAP */
+        *length = QRR_FULL_ABI_INT_SIZE;
+        return true;
     default:
         break;
     }
@@ -2137,6 +2640,27 @@ static bool qrr_full_ioctl_output_length(target_ulong request,
         return true;
     case 0x5413: /* TIOCGWINSZ */
         *length = 8;
+        return true;
+    case 0x8910: /* SIOCGIFNAME */
+    case 0x8913: /* SIOCGIFFLAGS */
+    case 0x8915: /* SIOCGIFADDR */
+    case 0x8917: /* SIOCGIFDSTADDR */
+    case 0x8919: /* SIOCGIFBRDADDR */
+    case 0x891b: /* SIOCGIFNETMASK */
+    case 0x891d: /* SIOCGIFMETRIC */
+    case 0x891f: /* SIOCGIFMEM */
+    case 0x8921: /* SIOCGIFMTU */
+    case 0x8927: /* SIOCGIFHWADDR */
+    case 0x8929: /* SIOCGIFSLAVE */
+    case 0x8933: /* SIOCGIFINDEX */
+    case 0x8935: /* SIOCGIFPFLAGS */
+    case 0x8942: /* SIOCGIFTXQLEN */
+    case 0x8970: /* SIOCGIFMAP */
+    case 0x8b01: /* SIOCGIWNAME */
+        *length = QRR_FULL_TARGET_IFREQ_SIZE;
+        return true;
+    case 0x8925: /* SIOCGIFENCAP */
+        *length = QRR_FULL_ABI_INT_SIZE;
         return true;
     default:
         break;
@@ -2327,6 +2851,10 @@ static bool qrr_full_direct_output_location(int syscall_nr,
         *out_arg = 2;
         *length = 2 * TARGET_LONG_SIZE;
         return args[1] != 0;
+    case 4116:
+        *out_arg = 1;
+        *length = QRR_FULL_TARGET_SYSINFO_SIZE;
+        return args[0] != 0;
     case 4140:
         *out_arg = 4;
         *length = 8;
@@ -2404,6 +2932,10 @@ static bool qrr_full_direct_output_location(int syscall_nr,
         *out_arg = 2;
         *length = 2 * TARGET_LONG_SIZE;
         return args[1] != 0;
+    case 116:
+        *out_arg = 1;
+        *length = QRR_FULL_TARGET_SYSINFO_SIZE;
+        return args[0] != 0;
     case 140:
         *out_arg = 4;
         *length = 8;
@@ -2433,6 +2965,10 @@ static bool qrr_full_output_required(int syscall_nr, const target_ulong args[6],
     }
 #ifdef TARGET_MIPS
     switch (syscall_nr) {
+    case 4116:
+        return args[0] != 0;
+    case 4114:
+        return ret > 0 && (args[1] || args[3]);
     case 4140:
     case 4142:
     case 4171:
@@ -2452,6 +2988,10 @@ static bool qrr_full_output_required(int syscall_nr, const target_ulong args[6],
     }
 #elif defined(TARGET_ARM)
     switch (syscall_nr) {
+    case 116:
+        return args[0] != 0;
+    case 114:
+        return ret > 0 && (args[1] || args[3]);
     case 82:
     case 106:
     case 107:
@@ -3079,6 +3619,7 @@ static char *qrr_full_encode_shmat(CPUState *cpu,
     static const unsigned char magic[] = { 'Q', 'S', 'H', 'M' };
     qrr_vmi_layout_t layout;
     qrr_vmi_vma_t *match = NULL;
+    QrrFullTargetPgd *target;
     QrrFullBuffer blob;
     target_ulong attached;
     target_ulong length_target;
@@ -3101,13 +3642,14 @@ static char *qrr_full_encode_shmat(CPUState *cpu,
         *failure = "shmat-attached-address-read-failed";
         goto out;
     }
-    if (!qrr_full_selected_task ||
-        pending->pgd != qrr_full_selected_pgd) {
-        *failure = "shmat-selected-task-missing";
+    target = qrr_full_target_process(pending->pgd);
+    if (!target || target->process_token != pending->process_token ||
+        !target->have_task || !target->task) {
+        *failure = "shmat-process-task-missing";
         goto out;
     }
     if (VMI_qrr_read_linux_layout_task_c(
-            cpu, qrr_full_selected_task, &layout,
+            cpu, target->task, &layout,
             profile_error, sizeof(profile_error)) != 0) {
         fprintf(stderr,
                 "qrr-full: SHMAT VMA lookup failed process=%016" PRIx64
@@ -3248,6 +3790,57 @@ static bool qrr_full_append_output_bytes(QrrFullBuffer *bundle,
     bundle->outputs++;
     bundle->payload_bytes += length;
     return true;
+}
+
+static bool qrr_full_is_wait4_syscall(int syscall_nr)
+{
+#ifdef TARGET_MIPS
+    return syscall_nr == 4114;
+#elif defined(TARGET_ARM)
+    return syscall_nr == 114;
+#else
+    (void)syscall_nr;
+    return false;
+#endif
+}
+
+/* wait4 has two independent output objects.  A successful reap writes the
+ * target-endian status word through arg2 and, when requested, the complete
+ * target struct rusage through arg4.  Store both as ordinary direct-argument
+ * bundle items so replay does not depend on host wait status or accounting. */
+static char *qrr_full_encode_wait4_bundle(CPUState *cpu,
+                                          const target_ulong args[6],
+                                          int64_t ret,
+                                          size_t *payload_bytes)
+{
+    static const unsigned char magic[] = { 'Q', 'R', 'R', 'B' };
+    QrrFullBuffer bundle;
+    char *hex = NULL;
+
+    *payload_bytes = 0;
+    if (ret <= 0 || (!args[1] && !args[3])) {
+        return NULL;
+    }
+    memset(&bundle, 0, sizeof(bundle));
+    if (!qrr_full_buf_append(&bundle, magic, sizeof(magic)) ||
+        !qrr_full_buf_append_u8(&bundle, QRR_FULL_BUNDLE_VERSION) ||
+        !qrr_full_buf_append_le16(&bundle, 0) ||
+        (args[1] && !qrr_full_append_output_from_guest(
+            cpu, &bundle, QRR_FULL_OUTPUT_DIRECT_ARG, 2, 0, args[1],
+            QRR_FULL_TARGET_WAIT_STATUS_SIZE)) ||
+        (args[3] && !qrr_full_append_output_from_guest(
+            cpu, &bundle, QRR_FULL_OUTPUT_DIRECT_ARG, 4, 0, args[3],
+            QRR_FULL_TARGET_RUSAGE_SIZE))) {
+        goto out;
+    }
+    bundle.data[5] = bundle.outputs & 0xff;
+    bundle.data[6] = (bundle.outputs >> 8) & 0xff;
+    *payload_bytes = bundle.payload_bytes;
+    hex = qrr_full_hex_from_bytes(bundle.data, bundle.len);
+
+out:
+    qrr_full_buf_free(&bundle);
+    return hex;
 }
 
 static bool qrr_full_select_fdset_length(target_ulong nfds, size_t *length)
@@ -4025,6 +4618,7 @@ static bool qrr_full_same_syscall_return(target_ulong entry_pc,
 static void qrr_full_free_fork_pending(QrrFullForkPending *pending)
 {
     QrrFullFdPath *entry;
+    QrrFullMmapMapping *mapping;
 
     if (!pending) {
         return;
@@ -4038,7 +4632,114 @@ static void qrr_full_free_fork_pending(QrrFullForkPending *pending)
         free(entry);
         entry = next;
     }
+    mapping = pending->mmap_mappings;
+    while (mapping) {
+        QrrFullMmapMapping *next = mapping->next;
+
+        qrr_full_free_mmap_mapping(mapping);
+        mapping = next;
+    }
     free(pending);
+}
+
+static QrrFullMmapMapping *qrr_full_clone_mmap_mapping(
+    const QrrFullMmapMapping *source)
+{
+    QrrFullMmapMapping *copy;
+    QrrFullMmapPage **page_tail;
+    const QrrFullMmapPage *page;
+
+    copy = calloc(1, sizeof(*copy));
+    if (!copy) {
+        fprintf(stderr, "qrr-full: cannot snapshot fork mmap mapping\n");
+        exit(2);
+    }
+    *copy = *source;
+    copy->path = source->path ? strdup(source->path) : NULL;
+    copy->pages = NULL;
+    copy->next = NULL;
+    if (source->path && !copy->path) {
+        qrr_full_free_mmap_mapping(copy);
+        fprintf(stderr, "qrr-full: cannot snapshot fork mmap path\n");
+        exit(2);
+    }
+    page_tail = &copy->pages;
+    for (page = source->pages; page; page = page->next) {
+        QrrFullMmapPage *page_copy = malloc(sizeof(*page_copy));
+
+        if (!page_copy) {
+            qrr_full_free_mmap_mapping(copy);
+            fprintf(stderr, "qrr-full: cannot snapshot fork mmap page\n");
+            exit(2);
+        }
+        *page_copy = *page;
+        page_copy->next = NULL;
+        *page_tail = page_copy;
+        page_tail = &page_copy->next;
+    }
+    return copy;
+}
+
+static void qrr_full_emit_inherited_mmap_mapping(
+    QrrFullPathState *state, const QrrFullMmapMapping *mapping)
+{
+    char *path_hex = NULL;
+    const char *path_column = "-";
+
+    if (!qrr_full_mmap_fp || !state || !state->process_token ||
+        state->process_token != mapping->process_token) {
+        fprintf(stderr,
+                "qrr-full: cannot emit inherited mmap mapping"
+                " process=%016" PRIx64 " mapping=%016" PRIx64 "\n",
+                mapping->process_token, mapping->mapping_id);
+        exit(2);
+    }
+    if (mapping->path) {
+        path_hex = qrr_full_hex_from_bytes(
+            (const unsigned char *)mapping->path, strlen(mapping->path));
+        if (!path_hex) {
+            fprintf(stderr,
+                    "qrr-full: cannot encode inherited mmap path"
+                    " process=%016" PRIx64 " mapping=%016" PRIx64 "\n",
+                    mapping->process_token, mapping->mapping_id);
+            exit(2);
+        }
+        path_column = path_hex;
+    }
+    if (state->mmap_event_seq == UINT64_MAX) {
+        fprintf(stderr,
+                "qrr-full: inherited mmap event sequence exhausted"
+                " process=%016" PRIx64 "\n", state->process_token);
+        free(path_hex);
+        exit(2);
+    }
+    state->mmap_event_seq++;
+    fprintf(qrr_full_mmap_fp,
+            "%016" PRIx64 "\t%" PRIu64 "\tmap\t%016" PRIx64
+            "\t%" PRIu64 "\t%016" PRIx64 "\t%016" PRIx64
+            "\t%016" PRIx64 "\t%016" PRIx64 "\t%016" PRIx64
+            "\t%d\t%016" PRIx64 "\t%016x\t-\t%016x\t%" PRIu64
+            "\t%d\t%016x\t%016" PRIx64 "\t%016" PRIx64
+            "\t-\t%016x\t%016x\t%s\t-\n",
+            mapping->process_token, state->mmap_event_seq,
+            mapping->mapping_id, mapping->mmap_sequence, mapping->mmap_key,
+            (uint64_t)mapping->start, (uint64_t)mapping->length,
+            (uint64_t)mapping->prot, (uint64_t)mapping->flags, mapping->fd,
+            mapping->file_offset, 0, 0, (uint64_t)0, 0, 0,
+            (uint64_t)0, (uint64_t)0, 0, 0, path_column);
+    if (fflush(qrr_full_mmap_fp) != 0) {
+        fprintf(stderr, "qrr-full: inherited mmap table flush failed: %s\n",
+                strerror(errno));
+        free(path_hex);
+        exit(2);
+    }
+    fprintf(stderr,
+            "qrr-full: inherited mmap mapping process=%016" PRIx64
+            " mapping=%016" PRIx64 " range=" TARGET_FMT_lx "+"
+            TARGET_FMT_lx "\n",
+            mapping->process_token, mapping->mapping_id,
+            mapping->start, mapping->length);
+    free(path_hex);
 }
 
 static void qrr_full_remove_fork_pending(QrrFullForkPending *pending)
@@ -4060,15 +4761,25 @@ static void qrr_full_capture_target_fork(CPUState *cpu, target_ulong pgd,
                                          target_ulong stack)
 {
     QrrFullForkPending *pending;
+    QrrFullTargetPgd *target;
     QrrFullPathState *path_state;
     QrrFullFdPath *fd_path;
+    QrrFullMmapMapping *mapping;
 
+    target = qrr_full_target_process(pgd);
+    if (!target || !target->have_task || !target->task) {
+        fprintf(stderr,
+                "qrr-full: process fork entry has no exact parent task"
+                " pgd=" TARGET_FMT_lx "\n", pgd);
+        exit(2);
+    }
     pending = calloc(1, sizeof(*pending));
     if (!pending) {
         return;
     }
     pending->cpu = cpu;
     pending->source_pgd = pgd;
+    pending->source_task = target->task;
     pending->entry_pc = entry_pc;
     pending->stack = stack;
     path_state = qrr_full_path_state(pgd, true);
@@ -4100,60 +4811,213 @@ static void qrr_full_capture_target_fork(CPUState *cpu, target_ulong pgd,
         snapshot->next = pending->fd_paths;
         pending->fd_paths = snapshot;
     }
+    /* fork inherits the complete address space.  Snapshot the collector's
+     * mmap metadata now, before either parent or child can mutate it.  The
+     * child gets its own token/PGD objects when its exact return is seen;
+     * physical bytes are already inherited by the real guest fork. */
+    for (mapping = qrr_full_mmap_mappings; mapping;
+         mapping = mapping->next) {
+        QrrFullMmapMapping *snapshot;
+
+        if (mapping->pgd != pgd) {
+            continue;
+        }
+        snapshot = qrr_full_clone_mmap_mapping(mapping);
+        snapshot->next = pending->mmap_mappings;
+        pending->mmap_mappings = snapshot;
+    }
     pending->next = qrr_full_fork_pending;
     qrr_full_fork_pending = pending;
 }
 
-static void qrr_full_inherit_target_fork(CPUState *cpu, target_ulong pgd,
-                                         target_ulong return_pc,
-                                         target_ulong stack)
+/* proc_fork_connector(child_task) runs only after copy_process has created a
+ * real child task and mm.  It is therefore the authoritative fork identity
+ * boundary.  Never infer a child from a matching userspace return PC/SP:
+ * unrelated processes commonly return through the same libc clone wrapper. */
+static void qrr_full_note_fork_connector(CPUState *cpu,
+                                         target_ulong child_task)
 {
-    QrrFullForkPending *candidate;
+#ifdef TARGET_MIPS
+    CPUArchState *env;
+    target_ulong kernel_sp;
+    target_ulong thread_info;
+    target_ulong parent_task;
+    qrr_vmi_exec_identity_t parent_identity;
+    qrr_vmi_exec_identity_t child_identity;
     QrrFullForkPending *pending = NULL;
+    QrrFullForkPending *candidate;
     QrrFullPathState *target_state;
     QrrFullFdPath *fd_path;
+    QrrFullMmapMapping *mapping;
+    QrrFullTargetPgd *target;
+    char error[128];
 
-    /*
-     * A single virtual CPU can have several fork children waiting to run.
-     * The list is newest-first, so retain the last matching entry to consume
-     * fork completions in the same order that their parents issued them.
-     */
+    if (!qrr_full_init() || !qrr_full_follow_fork_descendants ||
+        !child_task) {
+        return;
+    }
+    env = cpu->env_ptr;
+    kernel_sp = env->active_tc.gpr[29];
+    if (kernel_sp < UINT32_C(0x80000000)) {
+        fprintf(stderr,
+                "qrr-full: proc_fork_connector executed outside kernel"
+                " child_task=" TARGET_FMT_lx "\n", child_task);
+        exit(2);
+    }
+    thread_info = kernel_sp & ~(QRR_FULL_MIPS_THREAD_SIZE - 1);
+    if (VMI_qrr_task_from_thread_info_c(
+            cpu, thread_info, &parent_task, error, sizeof(error)) != 0) {
+        fprintf(stderr,
+                "qrr-full: proc_fork_connector parent task lookup failed"
+                " child_task=" TARGET_FMT_lx " reason=%s\n",
+                child_task, error[0] ? error : "unknown");
+        exit(2);
+    }
+
+    /* Only a logical process-fork syscall from an already selected family
+     * member has a pending record.  Thread clones and unrelated system forks
+     * take this exact hook too, but have no matching source_task and are
+     * intentionally ignored. */
     for (candidate = qrr_full_fork_pending; candidate;
          candidate = candidate->next) {
-        if (candidate->cpu == cpu && candidate->source_pgd != pgd &&
-            qrr_full_same_syscall_return(candidate->entry_pc,
-                                         candidate->stack,
-                                         return_pc, stack)) {
+        if (candidate->cpu == cpu &&
+            candidate->source_task == parent_task) {
+            if (pending) {
+                fprintf(stderr,
+                        "qrr-full: conflicting process forks for exact"
+                        " parent task=" TARGET_FMT_lx "\n", parent_task);
+                exit(2);
+            }
             pending = candidate;
         }
     }
     if (!pending) {
         return;
     }
-    if (pending->have_path_state) {
-        target_state = qrr_full_path_state(pgd, true);
-        if (target_state) {
-            QrrFullPathState *next = target_state->next;
+    if (VMI_qrr_read_exec_identity_c(
+            cpu, parent_task, &parent_identity,
+            error, sizeof(error)) != 0) {
+        fprintf(stderr,
+                "qrr-full: proc_fork_connector parent identity failed"
+                " task=" TARGET_FMT_lx " reason=%s\n",
+                parent_task, error[0] ? error : "unknown");
+        exit(2);
+    }
+    if (VMI_qrr_read_exec_identity_c(
+            cpu, child_task, &child_identity,
+            error, sizeof(error)) != 0) {
+        fprintf(stderr,
+                "qrr-full: proc_fork_connector child identity failed"
+                " task=" TARGET_FMT_lx " reason=%s\n",
+                child_task, error[0] ? error : "unknown");
+        exit(2);
+    }
+    if (parent_identity.task != pending->source_task ||
+        parent_identity.pgd != pending->source_pgd) {
+        fprintf(stderr,
+                "qrr-full: proc_fork_connector parent identity conflict"
+                " expected_task=" TARGET_FMT_lx
+                " actual_task=" TARGET_FMT_lx
+                " expected_pgd=" TARGET_FMT_lx
+                " actual_pgd=" TARGET_FMT_lx "\n",
+                pending->source_task, parent_identity.task,
+                pending->source_pgd, parent_identity.pgd);
+        exit(2);
+    }
+    if (!child_identity.mm || !child_identity.pgd ||
+        child_identity.pgd == parent_identity.pgd) {
+        fprintf(stderr,
+                "qrr-full: process fork connector did not create an"
+                " isolated child mm parent_task=" TARGET_FMT_lx
+                " child_task=" TARGET_FMT_lx
+                " parent_pgd=" TARGET_FMT_lx
+                " child_pgd=" TARGET_FMT_lx "\n",
+                parent_task, child_task, parent_identity.pgd,
+                child_identity.pgd);
+        exit(2);
+    }
 
-            memcpy(target_state, &pending->path_state, sizeof(*target_state));
-            target_state->pgd = pgd;
-            target_state->process_token = pending->child_process_token;
-            target_state->next_fork_ordinal = 0;
-            target_state->next = next;
-            qrr_full_user_edge_remove_all(pgd);
+    /* The connector proves both child task and child PGD.  A pre-existing
+     * owner of that physical PGD can only be stale reuse from a process whose
+     * exit was not observable at a userspace syscall boundary. */
+    target = qrr_full_target_process(child_identity.pgd);
+    if (target) {
+        if (target->have_task && target->task == child_task) {
+            fprintf(stderr,
+                    "qrr-full: duplicate proc_fork_connector child"
+                    " task=" TARGET_FMT_lx " pgd=" TARGET_FMT_lx "\n",
+                    child_task, child_identity.pgd);
+            exit(2);
         }
+        qrr_full_unbind_process(child_identity.pgd,
+                                "fork-connector-pgd-reuse");
+    }
+    if (!pending->have_path_state || !pending->child_process_token) {
+        fprintf(stderr,
+                "qrr-full: inherited target fork has no parent path state"
+                " parent_pgd=" TARGET_FMT_lx " child_pgd=" TARGET_FMT_lx
+                "\n", pending->source_pgd, child_identity.pgd);
+        exit(2);
+    }
+    target_state = qrr_full_path_state(child_identity.pgd, true);
+    if (!target_state) {
+        fprintf(stderr,
+                "qrr-full: cannot allocate inherited target path state"
+                " child_pgd=" TARGET_FMT_lx "\n", child_identity.pgd);
+        exit(2);
+    }
+    {
+        QrrFullPathState *next = target_state->next;
+
+        memcpy(target_state, &pending->path_state, sizeof(*target_state));
+        target_state->pgd = child_identity.pgd;
+        target_state->process_token = pending->child_process_token;
+        target_state->next_fork_ordinal = 0;
+        target_state->next = next;
+        /* A process token is an execution instance.  Edge occurrences begin
+         * empty in the child on both collection and replay. */
+        qrr_full_user_edge_remove_all(child_identity.pgd);
     }
     for (fd_path = pending->fd_paths; fd_path; fd_path = fd_path->next) {
-        qrr_full_fd_set(pgd, fd_path->fd, fd_path->path);
+        qrr_full_fd_set(child_identity.pgd, fd_path->fd, fd_path->path);
     }
-    qrr_full_bind_process_token(pgd, qrr_full_target_name,
+    qrr_full_bind_process_token(child_identity.pgd, qrr_full_target_name,
                                 pending->child_process_token,
                                 false);
+    target = qrr_full_target_process(child_identity.pgd);
+    if (!target) {
+        fprintf(stderr,
+                "qrr-full: exact fork child binding disappeared"
+                " child_pgd=" TARGET_FMT_lx "\n", child_identity.pgd);
+        exit(2);
+    }
+    target->task = child_task;
+    target->have_task = true;
+    mapping = pending->mmap_mappings;
+    pending->mmap_mappings = NULL;
+    while (mapping) {
+        QrrFullMmapMapping *next = mapping->next;
+
+        mapping->pgd = child_identity.pgd;
+        mapping->process_token = pending->child_process_token;
+        mapping->next = qrr_full_mmap_mappings;
+        qrr_full_mmap_mappings = mapping;
+        qrr_full_emit_inherited_mmap_mapping(target_state, mapping);
+        mapping = next;
+    }
     fprintf(stderr,
             "qrr-full: inherited target fork pgd=" TARGET_FMT_lx
-            " parent_pgd=" TARGET_FMT_lx " process=%016" PRIx64 "\n",
-            pgd, pending->source_pgd, pending->child_process_token);
+            " parent_pgd=" TARGET_FMT_lx
+            " parent_task=" TARGET_FMT_lx
+            " child_task=" TARGET_FMT_lx
+            " process=%016" PRIx64 " source=proc_fork_connector\n",
+            child_identity.pgd, pending->source_pgd, parent_task,
+            child_task, pending->child_process_token);
     qrr_full_remove_fork_pending(pending);
+#else
+    (void)cpu;
+    (void)child_task;
+#endif
 }
 
 static void qrr_full_discard_failed_target_fork(CPUState *cpu,
@@ -4164,18 +5028,25 @@ static void qrr_full_discard_failed_target_fork(CPUState *cpu,
 {
     QrrFullForkPending *pending;
 
-    if (ret >= 0) {
-        return;
-    }
     for (pending = qrr_full_fork_pending; pending;
          pending = pending->next) {
         if (pending->cpu == cpu && pending->source_pgd == pgd &&
             qrr_full_same_syscall_return(pending->entry_pc,
                                          pending->stack,
                                          return_pc, stack)) {
+            if (ret >= 0) {
+                fprintf(stderr,
+                        "qrr-full: successful target fork had no exact"
+                        " proc_fork_connector event source_task="
+                        TARGET_FMT_lx " source_pgd=" TARGET_FMT_lx
+                        " ret=%" PRId64 "\n",
+                        pending->source_task, pgd, ret);
+                exit(2);
+            }
             fprintf(stderr,
-                    "qrr-full: target fork failed source_pgd="
-                    TARGET_FMT_lx " ret=%" PRId64 "\n", pgd, ret);
+                    "qrr-full: target fork failed source_task="
+                    TARGET_FMT_lx " source_pgd=" TARGET_FMT_lx
+                    " ret=%" PRId64 "\n", pending->source_task, pgd, ret);
             qrr_full_remove_fork_pending(pending);
             return;
         }
@@ -5002,6 +5873,8 @@ static bool qrr_full_exec_event(CPUState *cpu, target_ulong pgd,
     target_ulong argv_addr = args[1];
     uint32_t argc = 0;
     bool target_match = false;
+    bool source_was_target = qrr_full_trace_pgd(pgd);
+    bool filename_captured;
 
     if (!qrr_full_is_execve_syscall(syscall_nr)) {
         return false;
@@ -5009,12 +5882,15 @@ static bool qrr_full_exec_event(CPUState *cpu, target_ulong pgd,
     *matched_target = false;
     memset(&filename, 0, sizeof(filename));
     memset(&argv, 0, sizeof(argv));
-    if (!qrr_full_read_guest_string(cpu, args[0], &filename, false)) {
+    filename_captured = qrr_full_read_guest_string(
+        cpu, args[0], &filename, false);
+    if (!filename_captured && !source_was_target) {
         goto out;
     }
-    target_match = qrr_full_exec_filename_matches_target(&filename);
+    target_match = filename_captured &&
+        qrr_full_exec_filename_matches_target(&filename);
     *matched_target = target_match;
-    if (!target_match) {
+    if (!target_match && !source_was_target) {
         goto out;
     }
     pending = calloc(1, sizeof(*pending));
@@ -5027,8 +5903,25 @@ static bool qrr_full_exec_event(CPUState *cpu, target_ulong pgd,
     pending->entry_pc = entry_pc;
     pending->stack = stack;
     pending->syscall_nr = syscall_nr;
-    pending->target_match = true;
-    pending->source_was_target = qrr_full_trace_pgd(pgd);
+    pending->target_match = target_match;
+    pending->source_was_target = source_was_target;
+    if (!filename_captured) {
+        /* A valid exec filename may live in a demand-paged user VMA.  At the
+         * syscall boundary the guest kernel has not run copy_from_user yet,
+         * so failure of the collector's VA->PA walk does not prove an invalid
+         * exec.  Keep the exact task-bound pending event and let the real
+         * proc_exec_connector decide successful target/non-target identity.
+         * If exec fails, the normal userspace return discards this pending
+         * record without changing process ownership. */
+        snprintf(pending->capture_error, sizeof(pending->capture_error),
+                 "filename_not_resident_at_entry");
+        fprintf(stderr,
+                "qrr-full: deferred bound process exec identity to"
+                " proc_exec_connector pgd=" TARGET_FMT_lx
+                " entry_pc=" TARGET_FMT_lx " filename=" TARGET_FMT_lx
+                "\n", pgd, entry_pc, args[0]);
+        goto queue;
+    }
     pending->filename_hex = qrr_full_hex_from_bytes(
         filename.data, filename.len);
     if (!pending->filename_hex) {
@@ -5076,7 +5969,7 @@ queue:
     pending->next = qrr_full_exec_pending;
     qrr_full_exec_pending = pending;
     fprintf(stderr,
-            "qrr-full: target exec syscall pending source_pgd="
+            "qrr-full: exec syscall pending source_pgd="
             TARGET_FMT_lx " entry_pc=" TARGET_FMT_lx " argc=%u reason=%s\n",
             pgd, entry_pc, argc,
             pending->capture_error[0] ? pending->capture_error : "-");
@@ -5171,6 +6064,7 @@ static void qrr_full_record_successful_exec(target_ulong source_pgd,
                 pending->syscall_nr, pending->sequence, out_arg, token_hex,
                 pending->process_token);
     }
+    qrr_full_schedule_commit(pending);
     qrr_full_event(pending, 0, 0, out_arg,
                    target_match ? 8 : 0, "record",
                    target_match ? "exec_target" : "exec_non_target");
@@ -5188,6 +6082,34 @@ static QrrFullPending *qrr_full_pending_find_pgd(target_ulong pgd)
         }
     }
     return NULL;
+}
+
+/* Threads are intentionally outside the current QRR process model.  For one
+ * execution instance, a second trap at an entry PC/SP whose first trap is
+ * still pending is the kernel's re-entry into that same logical syscall.
+ * Match the complete saved user register identity so a syscall made by a
+ * signal handler remains an independent operation.  In particular, do not
+ * infer restart from EINTR, a syscall number, or adjacency in the table. */
+static QrrFullPending *qrr_full_pending_find_entry_anchor(
+    target_ulong pgd, target_ulong entry_pc, target_ulong stack)
+{
+    QrrFullPending *pending;
+
+    for (pending = qrr_full_pending_head; pending; pending = pending->next) {
+        if (pending->pgd == pgd && pending->entry_pc == entry_pc &&
+            pending->stack == stack) {
+            return pending;
+        }
+    }
+    return NULL;
+}
+
+static bool qrr_full_pending_same_attempt(
+    const QrrFullPending *pending, int syscall_nr,
+    const target_ulong args[6])
+{
+    return pending->syscall_nr == syscall_nr &&
+           memcmp(pending->args, args, sizeof(pending->args)) == 0;
 }
 
 static void qrr_full_semaphore_lock_call_remove(
@@ -5479,7 +6401,9 @@ static void qrr_full_record_signal_delivery(CPUState *cpu,
     uint32_t info_word1;
     uint32_t info_word2;
     uint32_t fault_addr;
+    uint32_t interrupted_cause;
     uint32_t interrupted_pc;
+    uint32_t delivery_pc;
     uint32_t interrupted_sp;
     uint64_t key = 0;
     uint64_t syscall_sequence = 0;
@@ -5490,6 +6414,7 @@ static void qrr_full_record_signal_delivery(CPUState *cpu,
     uint64_t edge_occurrence = 0;
     int syscall_nr = -1;
     const char *anchor_kind = "user";
+    bool delay_slot;
 
     if (signo <= 0 || signo > 64 || !qrr_full_trace_pgd(call->pgd)) {
         return;
@@ -5514,6 +6439,9 @@ static void qrr_full_record_signal_delivery(CPUState *cpu,
             cpu, call->info_ptr + QRR_FULL_MIPS_SIGINFO_UNION_OFFSET + 8,
             &info_word2) ||
         !qrr_full_read_target_u32(
+            cpu, call->regs_ptr + QRR_FULL_MIPS_PT_REGS_CAUSE_OFFSET,
+            &interrupted_cause) ||
+        !qrr_full_read_target_u32(
             cpu, call->regs_ptr + QRR_FULL_MIPS_PT_REGS_EPC_OFFSET,
             &interrupted_pc) ||
         !qrr_full_read_target_u32(
@@ -5526,6 +6454,15 @@ static void qrr_full_record_signal_delivery(CPUState *cpu,
                 call->pgd, signo, call->info_ptr, call->regs_ptr);
         exit(2);
     }
+    delay_slot = (interrupted_cause & QRR_FULL_MIPS_CAUSE_BD) != 0;
+    if (delay_slot && interrupted_pc > UINT32_MAX - 4) {
+        fprintf(stderr,
+                "qrr-full: delivered signal delay-slot PC overflow pgd="
+                TARGET_FMT_lx " signo=%d epc=%08" PRIx32 "\n",
+                call->pgd, signo, interrupted_pc);
+        exit(2);
+    }
+    delivery_pc = interrupted_pc + (delay_slot ? 4 : 0);
     info_pid = info_word0;
     info_uid = info_word1;
     info_status = info_word2;
@@ -5547,25 +6484,57 @@ static void qrr_full_record_signal_delivery(CPUState *cpu,
     } else {
         qrr_full_current_signal_context(state, &path_hash, &dep_hash);
         syscall_sequence = state->syscall_seq;
-        edge_from_pc = state->have_previous_user_edge_pc ?
-            state->previous_user_edge_pc : 0;
-        edge_to_pc = interrupted_pc;
+        if (state->have_interrupted_user_edge &&
+            state->interrupted_next_pc != delivery_pc) {
+            fprintf(stderr,
+                    "qrr-full: delivered user signal contradicts saved"
+                    " interrupted-TB anchor pgd=" TARGET_FMT_lx
+                    " signo=%d delivery_pc=%08" PRIx32
+                    " have_interrupt=%d interrupt_next=" TARGET_FMT_lx
+                    "\n",
+                    call->pgd, signo, delivery_pc,
+                    state->have_interrupted_user_edge,
+                    state->interrupted_next_pc);
+            exit(2);
+        }
+        /*
+         * A signal can be selected either while returning from an interrupted
+         * user TB or at a kernel-to-user resume boundary (most commonly just
+         * after a completed syscall).  The latter has no interrupted TB to
+         * recover: the exact execution edge is the last committed user
+         * instruction to the PC supplied by the kernel in pt_regs.  Both
+         * cases use the next occurrence of that exact semantic edge in this
+         * syscall interval; no signal number, EINTR result, or adjacent
+         * syscall is inferred.
+         */
+        edge_from_pc = state->have_interrupted_user_edge ?
+            state->interrupted_edge_from_pc :
+            (state->have_previous_user_edge_pc ?
+             state->previous_user_edge_pc : 0);
+        edge_to_pc = delivery_pc;
+        /* Count this semantic edge, not all QEMU TBs in the interval.  QEMU
+         * 2.10 system mode and QEMU 8.2 user mode may split the same linear
+         * instruction range into different TBs.  The replay side therefore
+         * creates a selective split at delivery_pc and counts the exact
+         * edge_from_pc -> delivery_pc occurrence. */
         edge_occurrence = qrr_full_user_edge_next_occurrence(
-            call->pgd, edge_from_pc, edge_to_pc);
+            call->pgd, edge_from_pc, delivery_pc);
+        state->have_interrupted_user_edge = false;
     }
     state->signal_seq++;
     fprintf(qrr_full_signal_fp,
             "%016" PRIx64 "\t%" PRIu64 "\t%s\t%016" PRIx64
             "\t%" PRIu64 "\t%d\t%016" PRIx64 "\t%016" PRIx64
             "\t%016" PRIx64 "\t%016" PRIx64 "\t%" PRIu64
-            "\t%016" PRIx64 "\t%016" PRIx64
-            "\t%d\t%" PRId32 "\t%" PRId32 "\t%" PRIu32
+            "\t%016" PRIx64 "\t%016" PRIx64 "\t%016" PRIx64
+            "\t%d\t%d\t%" PRId32 "\t%" PRId32 "\t%" PRIu32
             "\t%" PRIu32 "\t%" PRId32 "\t%016" PRIx64
             "\t%016" PRIx64 "\n",
             state->process_token, state->signal_seq, anchor_kind, key,
             syscall_sequence, syscall_nr, path_hash, dep_hash,
             (uint64_t)edge_from_pc, (uint64_t)edge_to_pc, edge_occurrence,
-            (uint64_t)interrupted_pc, (uint64_t)interrupted_sp, signo,
+            (uint64_t)delivery_pc, (uint64_t)interrupted_pc,
+            (uint64_t)interrupted_sp, delay_slot, signo,
             (int32_t)info_code, (int32_t)info_errno, info_pid, info_uid,
             (int32_t)info_status, (uint64_t)info_value,
             (uint64_t)fault_addr);
@@ -5578,12 +6547,13 @@ static void qrr_full_record_signal_delivery(CPUState *cpu,
             "qrr-full: signal process=%016" PRIx64 " event=%" PRIu64
             " signo=%d anchor=%s syscall_sequence=%" PRIu64
             " edge=%08" PRIx64 "->%08" PRIx64 "#%" PRIu64
-            " interrupted_pc=%08" PRIx32 " interrupted_sp=%08" PRIx32
+            " delivery_pc=%08" PRIx32 " interrupted_pc=%08" PRIx32
+            " interrupted_sp=%08" PRIx32 " delay_slot=%d"
             "\n",
             state->process_token, state->signal_seq, signo, anchor_kind,
             syscall_sequence, (uint64_t)edge_from_pc,
             (uint64_t)edge_to_pc, edge_occurrence,
-            interrupted_pc, interrupted_sp);
+            delivery_pc, interrupted_pc, interrupted_sp, delay_slot);
 #else
     (void)cpu;
     (void)call;
@@ -5732,6 +6702,7 @@ static void qrr_full_syscall_entry(CPUState *cpu)
 {
     QrrFullPathState *state;
     QrrFullPending *pending;
+    QrrFullPending *active_anchor;
     target_ulong args[6];
     target_ulong pgd;
     target_ulong pc;
@@ -5751,6 +6722,53 @@ static void qrr_full_syscall_entry(CPUState *cpu)
         return;
     }
     pgd = qrr_full_current_pgd(cpu);
+    /* A delivered signal can return to the interrupted syscall instruction
+     * and trap again while its original pending record is still live.  The
+     * exact entry PC/SP identifies that suspended logical syscall; handler
+     * syscalls have their own entry anchor and continue through the normal
+     * path below. */
+    if (qrr_full_trace_pgd(pgd) &&
+        qrr_full_recordable_syscall(syscall_nr)) {
+        active_anchor = qrr_full_pending_find_entry_anchor(pgd, pc, stack);
+        if (active_anchor) {
+            if (!qrr_full_pending_same_attempt(active_anchor, syscall_nr,
+                                               args)) {
+                fprintf(stderr,
+                        "qrr-full: conflicting syscall re-entry"
+                        " process=%016" PRIx64
+                        " logical=%" PRIu64 " attempt=%" PRIu64
+                        " pgd=" TARGET_FMT_lx " pc=" TARGET_FMT_lx
+                        " sp=" TARGET_FMT_lx " expected_nr=%d actual_nr=%d\n",
+                        active_anchor->process_token,
+                        active_anchor->logical_syscall_id,
+                        active_anchor->attempt_count + 1, pgd, pc, stack,
+                        active_anchor->syscall_nr, syscall_nr);
+                fflush(NULL);
+                exit(2);
+            }
+            if (active_anchor->attempt_count == UINT64_MAX) {
+                fprintf(stderr,
+                        "qrr-full: syscall attempt counter overflow"
+                        " process=%016" PRIx64 " logical=%" PRIu64 "\n",
+                        active_anchor->process_token,
+                        active_anchor->logical_syscall_id);
+                fflush(NULL);
+                exit(2);
+            }
+            active_anchor->attempt_count++;
+            fprintf(stderr,
+                    "qrr-full: logical syscall restart"
+                    " process=%016" PRIx64 " logical=%" PRIu64
+                    " sequence=%" PRIu64 " attempt=%" PRIu64
+                    " syscall=%d pc=" TARGET_FMT_lx " sp=" TARGET_FMT_lx
+                    "\n",
+                    active_anchor->process_token,
+                    active_anchor->logical_syscall_id,
+                    active_anchor->sequence, active_anchor->attempt_count,
+                    active_anchor->syscall_nr, pc, stack);
+            return;
+        }
+    }
     /* Exec launch metadata is observed at the syscall boundary so argv stays
      * exact.  It does not bind a process or enter the QRR syscall table; only
      * the successful proc_exec_connector hook may select the target PGD. */
@@ -5782,8 +6800,22 @@ static void qrr_full_syscall_entry(CPUState *cpu)
     pending->path_hash = path_hash;
     pending->dep_hash = dep_hash;
     pending->sequence = sequence;
+    pending->logical_syscall_id = sequence;
+    pending->attempt_count = 1;
     pending->process_token = state->process_token;
     memcpy(pending->args, args, sizeof(pending->args));
+    /* Record logical syscall *entry* order independently of the result
+     * table.  A signal handler can complete later-sequence syscalls before
+     * the interrupted syscall returns, so result-row order is not a valid
+     * process schedule.  Restart attempts return above and therefore never
+     * create a second schedule event. */
+    qrr_full_schedule_entry(pending);
+    /* A process child is bound only after its exact fork return is observed.
+     * Its derived token keeps parent and child QRR streams isolated. */
+    if (qrr_full_follow_fork_descendants &&
+        qrr_full_is_process_fork_syscall(syscall_nr, args)) {
+        qrr_full_capture_target_fork(cpu, pgd, pc, stack);
+    }
     {
         int path_arg = qrr_full_open_path_arg(syscall_nr);
 
@@ -5801,7 +6833,24 @@ static void qrr_full_syscall_entry(CPUState *cpu)
                     pending->syscall_nr, pending->sequence,
                     pending->process_token);
         }
+        qrr_full_schedule_commit(pending);
         qrr_full_event(pending, 0, 0, 0, 0, "record", "no_return_exit");
+        /* A descendant may remain live after this member exits.  Keep the
+         * family active so its separately bound PGD and process token can
+         * continue collection. */
+        if (qrr_full_follow_fork_descendants) {
+            fprintf(stderr,
+                    "qrr-full: descendant-aware target exit"
+                    " pgd=" TARGET_FMT_lx " process=%016" PRIx64 "\n",
+                    pgd, pending->process_token);
+            /* The family remains active, but this address-space identity is
+             * dead.  Remove it now so a later Linux PGD reuse cannot inherit
+             * stale path/pending state or consume the old process token. */
+            qrr_full_unbind_process(pgd, "exit-syscall");
+            free(pending->open_path);
+            free(pending);
+            return;
+        }
         fprintf(stderr,
                 "qrr-full: selected target exited pgd=" TARGET_FMT_lx
                 " process=%016" PRIx64 "; collection stopped\n",
@@ -5836,6 +6885,9 @@ static void qrr_full_syscall_return(CPUState *cpu, target_ulong return_pc,
         return;
     }
     ret = qrr_full_syscall_ret(cpu);
+    if (qrr_full_follow_fork_descendants) {
+        qrr_full_discard_failed_target_fork(cpu, pgd, return_pc, stack, ret);
+    }
     pending = qrr_full_pending_take(pgd, return_pc, stack);
     if (!pending) {
         pending = qrr_full_pending_take_signal_return(pgd);
@@ -5904,6 +6956,16 @@ static void qrr_full_syscall_return(CPUState *cpu, target_ulong return_pc,
                               "mmap_event_capture_failed";
                 fatal_effect_capture = true;
             }
+        } else if (qrr_full_is_wait4_syscall(pending->syscall_nr) &&
+                   ret > 0 &&
+                   (pending->args[1] || pending->args[3])) {
+            out_arg = QRR_FULL_RESULT_OUT_ARG_BUNDLE;
+            hex = qrr_full_encode_wait4_bundle(cpu, pending->args, ret,
+                                               &output_bytes);
+            if (!hex) {
+                skip_reason = "wait4-output-capture-failed";
+                fatal_effect_capture = true;
+            }
         } else if (qrr_full_is_select_syscall(pending->syscall_nr)) {
             out_arg = QRR_FULL_RESULT_OUT_ARG_BUNDLE;
             hex = qrr_full_encode_select_bundle(cpu, pending->syscall_nr,
@@ -5938,6 +7000,10 @@ static void qrr_full_syscall_return(CPUState *cpu, target_ulong return_pc,
             hex = qrr_full_encode_guest_hex(cpu, output_addr, direct_length);
             if (!hex) {
                 skip_reason = "output_capture_failed";
+                /* Reaching this branch means the syscall has a known,
+                 * target-ABI output object.  A strict all-syscall table may
+                 * never silently omit that memory effect. */
+                fatal_effect_capture = true;
             } else {
                 output_bytes = direct_length;
             }
@@ -5975,6 +7041,7 @@ static void qrr_full_syscall_return(CPUState *cpu, target_ulong return_pc,
                 pending->syscall_nr, pending->sequence, ret, out_arg, hex,
                 pending->process_token);
     }
+    qrr_full_schedule_commit(pending);
     qrr_full_event(pending, return_pc, ret, out_arg, output_bytes,
                    "record", "-");
     free(hex);

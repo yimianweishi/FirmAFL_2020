@@ -45,6 +45,7 @@ int handle_recv = 0;
 int count_142 = 0;
 int count_3 = 0;
 int sys_count = 0;
+static int direct_fuzz_select_ready = 0;
 
 int CP0_UserLocal = 0;
 
@@ -91,12 +92,21 @@ void getconfig(char *keywords, char *res)
 {
     FILE *fp = fopen("FirmAFL_config", "r");
     char StrLine[256];
-    while (!feof(fp)) 
-    { 
-        fgets(StrLine,256,fp);
+    if (fp == NULL) {
+        fprintf(stderr, "FirmAFL_config: cannot open configuration file\n");
+        abort();
+    }
+    while (fgets(StrLine, sizeof(StrLine), fp) != NULL)
+    {
         char * key = strtok(StrLine, "=");
         char * value = strtok(NULL, "=");
+        if (key == NULL || value == NULL) {
+            continue;
+        }
         int val_len = strlen(value);
+        if (val_len == 0) {
+            continue;
+        }
         if(value[val_len-1] == '\n')
         {
             value[val_len-1] = '\0';
@@ -412,7 +422,8 @@ void prepare_feed_input(CPUState * cpu)
         //get_page_addr_code(env, content_addr); //important
         //write_ptr(cpu, environ_addr + 4, 0);
     }
-    else if(strcmp(feed_type, "FEED_HTTP") == 0)
+    else if(strcmp(feed_type, "FEED_HTTP") == 0 ||
+            getenv("QRR_FUZZ_FORCE_HTTP_FEED"))
     {
 
         /*
@@ -619,7 +630,8 @@ int feed_input(CPUState * cpu)
 
         return 1;
     }
-    else if(strcmp(feed_type, "FEED_HTTP") == 0) 
+    else if(strcmp(feed_type, "FEED_HTTP") == 0 ||
+            getenv("QRR_FUZZ_FORCE_HTTP_FEED"))
     {
         //DECAF_printf("feed input -----------\n");
         /*
@@ -964,16 +976,27 @@ bool delete_pgd(int pgd)
 /* Full-system QRR v12 includes execution/process-isolated replay keys. */
 #include "qrr-full-tcg.h"
 
+#ifdef FORK_OR_NOT
+/* The normal FirmAFL iothread handoff repairs the worker pool after the
+ * forkserver child is created.  The isolated direct forkserver reaches the
+ * same child return from the CPU path, so invoke that existing repair hook
+ * explicitly rather than leaving copied pthread state behind. */
+extern void spawn_thread_after_fork(void);
+#endif
+
 void qrr_full_tcg_tb_interrupted(CPUState *cpu, bool state_restored)
 {
     qrr_full_tb_interrupted(cpu, state_restored);
 }
 
 static DECAF_Handle qrr_exec_connector_handle = DECAF_NULL_HANDLE;
+static DECAF_Handle qrr_exit_connector_handle = DECAF_NULL_HANDLE;
+static DECAF_Handle qrr_fork_connector_handle = DECAF_NULL_HANDLE;
 
 static void qrr_exec_connector_callback(DECAF_Callback_Params *params)
 {
 #ifdef TARGET_MIPS
+    static target_ulong qrr_fuzz_bridged_pgd;
     CPUState *cpu;
     CPUArchState *env;
     target_ulong pc;
@@ -994,6 +1017,80 @@ static void qrr_exec_connector_callback(DECAF_Callback_Params *params)
     env = cpu->env_ptr;
     task = env->active_tc.gpr[4];
     qrr_full_note_exec_connector(cpu, task);
+#if defined(FUZZ)
+    /* The historical FirmAFL feed state machine still consumes the target
+     * PGD from its small legacy list.  Keep this bridge opt-in and isolated
+     * from normal QRR operation: qrr_full remains the sole target selector,
+     * while AFL can start only after that exact selected execution instance
+     * has been proven by proc_exec_connector. */
+    if (getenv("QRR_FUZZ_ENABLE_LEGACY_BRIDGE") &&
+        qrr_full_selected_pgd != 0 &&
+        qrr_fuzz_bridged_pgd != qrr_full_selected_pgd) {
+        qrr_fuzz_bridged_pgd = qrr_full_selected_pgd;
+        insert_pgd(qrr_full_selected_pgd);
+        fprintf(stderr,
+                "firmafl-fuzz: bridged QRR target PGD " TARGET_FMT_lx
+                " to legacy AFL feed\n", qrr_full_selected_pgd);
+    }
+#endif
+#else
+    (void)params;
+#endif
+}
+
+static void qrr_exit_connector_callback(DECAF_Callback_Params *params)
+{
+#ifdef TARGET_MIPS
+    CPUState *cpu;
+    CPUArchState *env;
+    target_ulong pc;
+    target_ulong task;
+
+    if (!params) {
+        return;
+    }
+    cpu = params->bb.env;
+    pc = params->bb.tb ? params->bb.tb->pc : 0;
+    if (pc != qrr_full_exit_connector_address()) {
+        fprintf(stderr,
+                "qrr-full: unexpected exit hook PC=" TARGET_FMT_lx
+                " expected=" TARGET_FMT_lx "\n",
+                pc, qrr_full_exit_connector_address());
+        exit(2);
+    }
+    env = cpu->env_ptr;
+    task = env->active_tc.gpr[4];
+    qrr_full_note_exit_connector(task);
+#else
+    (void)params;
+#endif
+}
+
+static void qrr_fork_connector_callback(DECAF_Callback_Params *params)
+{
+#ifdef TARGET_MIPS
+    CPUState *cpu;
+    CPUArchState *env;
+    target_ulong pc;
+    target_ulong child_task;
+
+    if (!params) {
+        return;
+    }
+    cpu = params->bb.env;
+    pc = params->bb.tb ? params->bb.tb->pc : 0;
+    if (pc != qrr_full_fork_connector_address()) {
+        fprintf(stderr,
+                "qrr-full: unexpected fork hook PC=" TARGET_FMT_lx
+                " expected=" TARGET_FMT_lx "\n",
+                pc, qrr_full_fork_connector_address());
+        exit(2);
+    }
+    /* Linux 3.2 proc_fork_connector(struct task_struct *task) receives the
+     * newly created child task in the first MIPS argument register. */
+    env = cpu->env_ptr;
+    child_task = env->active_tc.gpr[4];
+    qrr_full_note_fork_connector(cpu, child_task);
 #else
     (void)params;
 #endif
@@ -1076,6 +1173,29 @@ static void callbacktests_removeproc_callback(VMI_Callback_Params* params)
 #if defined(FUZZ) || defined(MEM_MAPPING)
     if(strcmp(procname,program_analysis) == 0)
     {
+#if defined(FUZZ)
+        /*
+         * Some EQUAFL HTTP daemons fork after bind(2): the parent exits,
+         * while the child keeps the same mm/PGD and accepts the request.
+         * The legacy AFL path identifies the target by PGD, so deleting the
+         * PGD at the parent's remove-proc callback loses the live child
+         * before the first recv/read can select the fork point.  This opt-in
+         * guard is only for the isolated AFL feed runner; QRR collection and
+         * the normal VMI process lifecycle retain the existing behavior.
+         */
+        if (!getenv("QRR_FULL_TCG_QRR") &&
+            !getenv("QRR_FULL_TCG_EVENTS") &&
+            !getenv("QRR_FULL_TCG_EXECS") &&
+            !getenv("QRR_FULL_TCG_SIGNALS") &&
+            !getenv("QRR_FULL_TCG_LAYOUT") &&
+            !getenv("QRR_FULL_TCG_MMAPS") &&
+            getenv("QRR_FUZZ_KEEP_LEGACY_TARGET_PGD")) {
+            fprintf(stderr,
+                    "firmafl-fuzz: retaining target PGD " TARGET_FMT_lx
+                    " across daemon parent exit\n", params->rp.cr3 & 0xfffff000);
+            return;
+        }
+#endif
         //DECAF_printf("\nProcname end:%s/%d,pid:%d, cur pgd:%x\n",procname, index, pid, params->rp.cr3);
         delete_pgd(params->rp.cr3);
 
@@ -1086,6 +1206,8 @@ static void callbacktests_removeproc_callback(VMI_Callback_Params* params)
 int callbacktests_init(void)
 {
     target_ulong exec_connector;
+    target_ulong exit_connector;
+    target_ulong fork_connector;
 
     DECAF_output_init(NULL);
     DECAF_printf("Hello World\n");
@@ -1097,9 +1219,13 @@ int callbacktests_init(void)
         exit(2);
 #endif
         exec_connector = qrr_full_exec_connector_address();
-        if (!exec_connector) {
+        exit_connector = qrr_full_exit_connector_address();
+        fork_connector = qrr_full_fork_connector_address();
+        if (!exec_connector || !exit_connector) {
             fprintf(stderr,
-                    "qrr-full: proc_exec_connector address unavailable\n");
+                    "qrr-full: process lifecycle connector address unavailable"
+                    " exec=" TARGET_FMT_lx " exit=" TARGET_FMT_lx "\n",
+                    exec_connector, exit_connector);
             exit(2);
         }
         qrr_exec_connector_handle =
@@ -1111,10 +1237,32 @@ int callbacktests_init(void)
                     TARGET_FMT_lx "\n", exec_connector);
             exit(2);
         }
+        qrr_exit_connector_handle =
+            DECAF_registerExactBlockBeginCallback(
+                &qrr_exit_connector_callback, NULL, exit_connector);
+        if (qrr_exit_connector_handle == DECAF_NULL_HANDLE) {
+            fprintf(stderr,
+                    "qrr-full: cannot register proc_exit_connector hook at "
+                    TARGET_FMT_lx "\n", exit_connector);
+            exit(2);
+        }
+        if (fork_connector) {
+            qrr_fork_connector_handle =
+                DECAF_registerExactBlockBeginCallback(
+                    &qrr_fork_connector_callback, NULL, fork_connector);
+            if (qrr_fork_connector_handle == DECAF_NULL_HANDLE) {
+                fprintf(stderr,
+                        "qrr-full: cannot register proc_fork_connector hook"
+                        " at " TARGET_FMT_lx "\n", fork_connector);
+                exit(2);
+            }
+        }
         fprintf(stderr,
-                "qrr-full: registered sole target-discovery TB hook"
-                " proc_exec_connector=" TARGET_FMT_lx "\n",
-                exec_connector);
+                "qrr-full: registered exact process lifecycle TB hooks"
+                " proc_exec_connector=" TARGET_FMT_lx
+                " proc_exit_connector=" TARGET_FMT_lx
+                " proc_fork_connector=" TARGET_FMT_lx "\n",
+                exec_connector, exit_connector, fork_connector);
         return 0;
     }
     processbegin_handle = VMI_register_callback(VMI_CREATEPROC_CB, &callbacktests_loadmainmodule_callback, NULL);
@@ -2518,6 +2666,45 @@ int start_fork(CPUState *cpu, target_ulong pc)
             */
             startTrace(cpu, code_start, code_end);
             printf("starttrace:%x,%x,\n", code_start, code_end);
+            /* Explicit AFL forkserver experiments must expose the same guest
+             * address range to AFL regardless of the FEED_HTTP code range.
+             * FirmAFL_config() commonly leaves code_start/code_end at zero;
+             * that is a stopTrace sentinel, not an instrumentation range.
+             * Keep this scoped to the opt-in forkserver paths so ordinary QRR
+             * capture/replay semantics remain untouched. */
+            if (getenv("QRR_FUZZ_DIRECT_FORKSERVER") ||
+                getenv("QRR_FUZZ_LEGACY_FORKSERVER")) {
+                afl_start_code = 0;
+                afl_end_code = (target_ulong)-1;
+            }
+            /* The legacy FirmAFL event-loop handoff is not reliable when the
+             * target is launched under the standalone AFL runner: the CPU
+             * thread writes FOR, but the iothread callback may not service it
+             * before AFL's forkserver deadline.  The isolated runner can
+             * request the same forkserver directly at the proven network
+             * anchor.  Production QRR/AFL paths remain unchanged unless this
+             * explicit experiment switch is set. */
+            if (getenv("QRR_FUZZ_DIRECT_FORKSERVER")) {
+                /* The old FEED_HTTP configuration leaves code_start/end at
+                 * zero; that range is a stopTrace sentinel, not an AFL
+                 * instrumentation range.  The explicit runner asks AFL to
+                 * observe the complete guest address space. */
+                afl_start_code = 0;
+                afl_end_code = (target_ulong)-1;
+                fprintf(stderr, "firmafl-fuzz: direct forkserver setup begin shm=%s\n",
+                        getenv(SHM_ENV_VAR) ? getenv(SHM_ENV_VAR) : "<unset>");
+                afl_setup();
+                fprintf(stderr, "firmafl-fuzz: direct forkserver setup done\n");
+                afl_forkserver(env);
+                fprintf(stderr, "firmafl-fuzz: direct forkserver returned child=%d\n",
+                        afl_fork_child);
+                if (afl_fork_child) {
+#ifdef FORK_OR_NOT
+                    spawn_thread_after_fork();
+#endif
+                    return 0;
+                }
+            }
             afl_user_fork = 1;
 #endif
             //exit_status = 0;
@@ -2584,14 +2771,38 @@ int feed_input_to_program(int program_id, CPUState *cpu, target_ulong sys_call_n
     target_ulong a3 = env->regs[3];
 #endif
 
+    if (getenv("QRR_FUZZ_DEBUG_FEED")) {
+        fprintf(stderr, "firmafl-fuzz: feed-check program=%d syscall=%lu a0=%lx a1=%lx a2=%lx a3=%lx accept=%d times=%d total=%d index=%d\n",
+                program_id, (unsigned long)sys_call_num, (unsigned long)a0,
+                (unsigned long)a1, (unsigned long)a2, (unsigned long)a3,
+                accept_fd, feed_input_times, total_len, buf_read_index);
+    }
+
 #ifdef TARGET_MIPS
-    if(a0 == accept_fd && (sys_call_num == 4175 || sys_call_num == 4003 || sys_call_num == 4176)
-     && strcmp(feed_type,"FEED_HTTP") == 0 && feed_input_times == 0) //161161
+    /* After the forkserver snapshot, some FirmAFL targets dup the accepted
+     * connection while rebuilding their descriptor set.  `handle_recv` is
+     * the explicit state established by determine_if_network_recv(), so it
+     * is a stronger identity than guessing a numeric fd offset.  Keep the
+     * legacy exact-fd check for normal runs and enable the state-based
+     * continuation only for the isolated AFL runner. */
+    int qrr_fuzz_feed_state = getenv("QRR_FUZZ_FORCE_HTTP_FEED") &&
+                              getenv("QRR_FUZZ_DIRECT_FORKSERVER") &&
+                              afl_user_fork && handle_recv;
+    if((a0 == accept_fd || qrr_fuzz_feed_state) &&
+       (sys_call_num == 4175 || sys_call_num == 4003 || sys_call_num == 4176)
+     && (strcmp(feed_type,"FEED_HTTP") == 0 ||
+         getenv("QRR_FUZZ_FORCE_HTTP_FEED")) && feed_input_times == 0) //161161
 #elif defined(TARGET_ARM)
     if(a0 == accept_fd && (sys_call_num == 3 || sys_call_num == 291 || sys_call_num == 292)
-     && strcmp(feed_type,"FEED_HTTP") == 0 && feed_input_times == 0) 
+     && (strcmp(feed_type,"FEED_HTTP") == 0 ||
+         getenv("QRR_FUZZ_FORCE_HTTP_FEED")) && feed_input_times == 0)
 #endif
     {
+        if (getenv("QRR_FUZZ_DEBUG_FEED")) {
+            fprintf(stderr, "firmafl-fuzz: feed-hit syscall=%lu fd=%lx len=%lx flags=%lx\n",
+                    (unsigned long)sys_call_num, (unsigned long)a0,
+                    (unsigned long)a2, (unsigned long)a3);
+        }
 #ifdef TARGET_MIPS
         get_page_addr_code(env, a1); //important
 #endif
@@ -2658,10 +2869,25 @@ void handle_accept_after(CPUState *cpu, target_ulong pc)
         target_ulong ret = env->active_tc.gpr[2];
 #endif
 
-        if(start_fork_pc == 0 && pc < kernel_base && into_syscall == accept_syscall) // after accept
+        if(start_fork_pc == 0 && pc < kernel_base &&
+           (into_syscall == accept_syscall || into_syscall == 4169)) // after accept/accept4
         {
             target_ulong pgd = DECAF_getPGD(cpu);
+            if (getenv("QRR_FUZZ_DEBUG_ACCEPT")) {
+                fprintf(stderr,
+                        "firmafl-fuzz: accept-return pgd=" TARGET_FMT_lx
+                        " in_syscall=%d ret=" TARGET_FMT_lx
+                        " legacy_target=%d target_pgd=" TARGET_FMT_lx "\n",
+                        pgd, into_syscall, ret, find_pgd(pgd), target_pgd);
+            }
             if(find_pgd(pgd)) {
+                /* Nonblocking listeners commonly probe accept4 before a
+                 * client is queued.  That failed attempt is not the
+                 * accepted connection and must not consume the configured
+                 * accept ordinal or become fd 0. */
+                if (ret <= 0) {
+                    return;
+                }
                 target_pgd = pgd;
                 accept_times++;
                 printf("_______{fd:%d\n", ret);
@@ -2784,6 +3010,69 @@ int cpu_exec(CPUState *cpu)
         qrr_full_syscall_entry(cpu);
     }
 
+#ifdef TARGET_MIPS
+    /* The direct AFL runner takes its snapshot at the first receive anchor.
+     * At that instant the accepted host socket may still have an empty
+     * userspace receive queue, so allowing the guest read to enter the real
+     * host syscall would block the testcase forever.  In this explicit
+     * experiment mode only, consume the AFL file at syscall entry and skip
+     * the host read.  Normal FirmAFL and QRR capture/replay paths retain the
+     * historical post-syscall feed hook. */
+    if (getenv("QRR_FUZZ_DIRECT_FORKSERVER") &&
+        afl_user_fork && cpu->exception_index == exception_num &&
+        /* A request may run in the accepted child or return to the
+         * forkserver snapshot's parent PGD after the host fork.  Both are
+         * explicit entries in the legacy target set populated by qrr-full;
+         * do not guess based on descriptor numbers alone. */
+        (DECAF_getPGD(cpu) == target_pgd ||
+         find_pgd(DECAF_getPGD(cpu))) && handle_recv) {
+        int direct_nr = env->active_tc.gpr[2];
+        int direct_fd = env->active_tc.gpr[4];
+        /* The server commonly waits in select(2) immediately after the
+         * snapshot.  Its host socket is deliberately not used for testcase
+         * bytes, so make the accepted descriptor readable once and let the
+         * receive hook below provide the actual AFL data. */
+        if (direct_nr == 4142) {
+            target_ulong readfds = env->active_tc.gpr[5];
+            if (readfds != 0) {
+                unsigned char ready_fds[128];
+                memset(ready_fds, 0xff, sizeof(ready_fds));
+                DECAF_write_mem(cpu, readfds, sizeof(ready_fds), ready_fds);
+            }
+            /* Keep the descriptor readable for each post-snapshot polling
+             * cycle.  The normal FirmAFL end-of-input logic observes the
+             * resulting select syscall and terminates the AFL child; leaving
+             * the host select in place would block forever on the snapshot's
+             * inherited socket. */
+            direct_fuzz_select_ready = 1;
+            skip_syscall(cpu, 1, 0);
+            /* A zero-length read after the AFL payload is the guest-side
+             * EOF boundary.  The historical FirmAFL termination path is
+             * driven by select(2); preserve that boundary for the explicit
+             * direct runner instead of entering the inherited host socket. */
+            if (total_len > 0 && buf_read_index >= total_len) {
+                prepare_exit();
+                doneWork(0);
+            }
+        }
+        if ((direct_nr == 4003 || direct_nr == 4175 || direct_nr == 4176) &&
+            (direct_fd == accept_fd || direct_fd > 0)) {
+            if (total_len == 0 && buf_read_index == 0)
+                feed_input(cpu);
+            int before_feed_index = buf_read_index;
+            if (feed_input_to_program(program_id, cpu, direct_nr) &&
+                buf_read_index != before_feed_index) {
+                /* The direct runner has supplied the complete AFL testcase.
+                 * Mark it consumed so later guest reads (often from the
+                 * snapshot PGD) receive EOF and cannot inject the same bytes
+                 * repeatedly. */
+                feed_input_times = 1;
+                skip_syscall(cpu, buf_read_index - before_feed_index, 0);
+            }
+        }
+    }
+#endif
+
 #if defined(FUZZ) || defined(MEM_MAPPING)
 
     //if(afl_user_fork == 0 && cpu->exception_index == exception_num && into_syscall == 0)
@@ -2802,10 +3091,17 @@ int cpu_exec(CPUState *cpu)
             }
 #elif defined(TARGET_MIPS)
             int syscall_num = env->active_tc.gpr[2];
-            //printf("##################program start syscall:%d,%x, args:%x,%x,%x,%x  ", syscall_num, pgd, env->active_tc.gpr[4], env->active_tc.gpr[5], env->active_tc.gpr[6], env->active_tc.gpr[7]);            if(syscall_num == 4168)
-            if(syscall_num == 4168)
+            // accept4 (4169) is used by several O32 network daemons.
+            if (getenv("QRR_FUZZ_DEBUG_ACCEPT") && syscall_num == 4169) {
+                fprintf(stderr,
+                        "firmafl-fuzz: accept-entry pgd=" TARGET_FMT_lx
+                        " legacy_target=%d qrr_target=" TARGET_FMT_lx "\n",
+                        DECAF_getPGD(cpu), find_pgd(DECAF_getPGD(cpu)),
+                        qrr_full_selected_pgd);
+            }
+            if(syscall_num == 4168 || syscall_num == 4169)
             {
-                into_syscall = 4168;
+                into_syscall = syscall_num;
             }
 #endif  
             record_current_state(cpu);

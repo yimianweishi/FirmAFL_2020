@@ -35,6 +35,7 @@
 
 #include "DECAF_main.h"
 #include "shared/DECAF_callback_to_QEMU.h"
+
 /* DEBUG defines, enable DEBUG_TLB_LOG to log to the CPU_LOG_MMU target */
 /* #define DEBUG_TLB */
 /* #define DEBUG_TLB_LOG */
@@ -973,7 +974,11 @@ static void *atomic_mmu_lookup(CPUArchState *env, target_ulong addr,
         goto stop_the_world;
     }
 
-    return (void *)((uintptr_t)addr + tlbe->addend);
+    {
+        uintptr_t host_addr = (uintptr_t)addr + tlbe->addend;
+
+        return (void *)host_addr;
+    }
 
  stop_the_world:
     cpu_loop_exit_atomic(ENV_GET_CPU(env), retaddr);

@@ -20363,7 +20363,6 @@ void gen_intermediate_code(CPUState *cs, struct TranslationBlock *tb)
             gen_io_start();
         }
 
-
 #if 1 /* AWH */
 	if (DECAF_is_callback_needed(DECAF_INSN_BEGIN_CB)){
 		TCGv pc = tcg_temp_new();

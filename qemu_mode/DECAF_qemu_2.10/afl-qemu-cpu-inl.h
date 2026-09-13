@@ -237,12 +237,21 @@ void afl_forkserver(CPUArchState *env){
 
   static unsigned char tmp[4];
 
-  if (!afl_area_ptr) return;
+  if (!afl_area_ptr) {
+    if (getenv("QRR_FUZZ_DIRECT_FORKSERVER"))
+      fprintf(stderr, "firmafl-fuzz: forkserver skipped: afl_area_ptr=NULL shm=%s\n", getenv(SHM_ENV_VAR) ? getenv(SHM_ENV_VAR) : "<unset>");
+    return;
+  }
 
   /* Tell the parent that we're alive. If the parent doesn't want
      to talk, assume that we're not running in forkserver mode. */
 
-  if (write(FORKSRV_FD + 1, tmp, 4) != 4) return;
+  {
+    ssize_t hs = write(FORKSRV_FD + 1, tmp, 4);
+    if (getenv("QRR_FUZZ_DIRECT_FORKSERVER"))
+      fprintf(stderr, "firmafl-fuzz: forkserver handshake fd=%d ret=%zd errno=%d\n", FORKSRV_FD + 1, hs, errno);
+    if (hs != 4) return;
+  }
 
   afl_forksrv_pid = getpid();
 
@@ -766,4 +775,3 @@ target_ulong afl_noforkserver_restart(CPUArchState *env, int status)
     //restore_page(1);
     return 0;
 }
-
