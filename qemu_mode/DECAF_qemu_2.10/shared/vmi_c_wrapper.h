@@ -68,6 +68,7 @@ typedef struct _qrr_vmi_exec_identity
   target_ulong mm;
   target_ulong pgd;
   uint32_t pid;
+  uint32_t tgid;
   char name[16];
 } qrr_vmi_exec_identity_t;
 

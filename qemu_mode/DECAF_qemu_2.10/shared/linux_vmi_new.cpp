@@ -117,6 +117,7 @@ extern "C" int VMI_qrr_load_linux_profile_c(
                                     "procinfo-exec-symbol-mismatch");
     }
     if (!qrr_vmi_profile_field_valid(profile.ts_pid) ||
+        !qrr_vmi_profile_field_valid(profile.ts_tgid) ||
         !qrr_vmi_profile_field_valid(profile.ts_mm) ||
         !qrr_vmi_profile_field_valid(profile.ts_fs) ||
         !qrr_vmi_profile_field_valid(profile.ts_comm) ||
@@ -168,6 +169,7 @@ extern "C" int VMI_qrr_read_exec_identity_c(
     target_ulong task_pgd;
     target_ulong physical_pgd;
     target_ulong pid;
+    target_ulong tgid;
 
     if (!env || !task || !identity) {
         return qrr_vmi_layout_error(error, error_size, "invalid-argument");
@@ -183,13 +185,15 @@ extern "C" int VMI_qrr_read_exec_identity_c(
         DECAF_read_ptr(env, identity->mm + OFFSET_PROFILE.mm_pgd,
                        &task_pgd) < 0 || !task_pgd ||
         DECAF_read_ptr(env, task + OFFSET_PROFILE.ts_pid, &pid) < 0 ||
+        DECAF_read_ptr(env, task + OFFSET_PROFILE.ts_tgid, &tgid) < 0 ||
         DECAF_read_mem(env, task + OFFSET_PROFILE.ts_comm,
                        sizeof(identity->name), identity->name) < 0) {
         return qrr_vmi_layout_error(error, error_size,
                                     "exec-task-read-failed");
     }
     if (!memchr(identity->name, '\0', sizeof(identity->name)) ||
-        !identity->name[0] || pid > UINT32_MAX) {
+        !identity->name[0] || pid > UINT32_MAX || !pid ||
+        tgid > UINT32_MAX || !tgid) {
         return qrr_vmi_layout_error(error, error_size,
                                     "exec-task-identity-invalid");
     }
@@ -209,6 +213,7 @@ extern "C" int VMI_qrr_read_exec_identity_c(
 #endif
     identity->pgd = physical_pgd;
     identity->pid = (uint32_t)pid;
+    identity->tgid = (uint32_t)tgid;
     if (error && error_size) {
         error[0] = '\0';
     }
