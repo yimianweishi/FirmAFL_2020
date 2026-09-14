@@ -68,7 +68,7 @@ typedef struct QrrFullOpenHow {
 #define QRR_FULL_RESULT_OUT_ARG_EXEC_TERMINATE 12
 #define QRR_FULL_SHMAT_VERSION 1
 #define QRR_FULL_SHMAT_HEADER_SIZE 32
-#define QRR_FULL_BUNDLE_VERSION 2
+#define QRR_FULL_BUNDLE_VERSION 3
 #define QRR_FULL_OUTPUT_DIRECT_ARG 1
 #define QRR_FULL_OUTPUT_RECVMSG_IOV 2
 #define QRR_FULL_OUTPUT_RECVMSG_NAME_DATA 6
@@ -77,7 +77,9 @@ typedef struct QrrFullOpenHow {
 #define QRR_FULL_OUTPUT_INDIRECT_ARG 9
 #define QRR_FULL_OUTPUT_SEMAPHORE_STATE 10
 #define QRR_FULL_OUTPUT_MREMAP_EFFECT 11
+#define QRR_FULL_OUTPUT_SECONDARY_RETURN 12
 #define QRR_FULL_MREMAP_EFFECT_SNAPSHOT_VERSION 1
+#define QRR_FULL_MIPS_NR_PIPE 4042
 #define QRR_FULL_MIPS_NR_IPC 4117
 #define QRR_FULL_IPCOP_SEMOP 1
 #define QRR_FULL_IPCOP_SEMTIMEDOP 4
@@ -4097,8 +4099,12 @@ static bool qrr_full_output_required(int syscall_nr, const target_ulong args[6],
     }
 #ifdef TARGET_MIPS
     switch (syscall_nr) {
+    case QRR_FULL_MIPS_NR_PIPE:
+        return ret >= 0;
     case 4116:
         return args[0] != 0;
+    case 4007:
+        return ret > 0 && args[1] != 0;
     case 4114:
         return ret > 0 && (args[1] || args[3]);
     case 4140:
@@ -4937,21 +4943,89 @@ static bool qrr_full_is_wait4_syscall(int syscall_nr)
 #endif
 }
 
-/* wait4 has two independent output objects.  A successful reap writes the
- * target-endian status word through arg2 and, when requested, the complete
- * target struct rusage through arg4.  Store both as ordinary direct-argument
- * bundle items so replay does not depend on host wait status or accounting. */
-static char *qrr_full_encode_wait4_bundle(CPUState *cpu,
-                                          const target_ulong args[6],
-                                          int64_t ret,
-                                          size_t *payload_bytes)
+static bool qrr_full_is_waitpid_syscall(int syscall_nr)
+{
+#ifdef TARGET_MIPS
+    return syscall_nr == 4007;
+#else
+    (void)syscall_nr;
+    return false;
+#endif
+}
+
+static bool qrr_full_is_wait_syscall(int syscall_nr)
+{
+    return qrr_full_is_wait4_syscall(syscall_nr) ||
+           qrr_full_is_waitpid_syscall(syscall_nr);
+}
+
+static bool qrr_full_is_secondary_return_syscall(int syscall_nr)
+{
+#ifdef TARGET_MIPS
+    return syscall_nr == QRR_FULL_MIPS_NR_PIPE;
+#else
+    (void)syscall_nr;
+    return false;
+#endif
+}
+
+/* MIPS O32 pipe returns its second descriptor in v1 rather than guest
+ * memory.  Model that architectural output explicitly; replay must not
+ * inherit whatever value happened to be in v1 before the syscall. */
+static char *qrr_full_encode_secondary_return_bundle(CPUState *cpu,
+                                                      size_t *payload_bytes)
+{
+#ifdef TARGET_MIPS
+    static const unsigned char magic[] = { 'Q', 'R', 'R', 'B' };
+    CPUArchState *env = cpu->env_ptr;
+    QrrFullBuffer bundle;
+    char *hex = NULL;
+
+    *payload_bytes = 0;
+    memset(&bundle, 0, sizeof(bundle));
+    if (!qrr_full_buf_append(&bundle, magic, sizeof(magic)) ||
+        !qrr_full_buf_append_u8(&bundle, QRR_FULL_BUNDLE_VERSION) ||
+        !qrr_full_buf_append_le16(&bundle, 1) ||
+        !qrr_full_buf_append_u8(&bundle,
+                                QRR_FULL_OUTPUT_SECONDARY_RETURN) ||
+        !qrr_full_buf_append_u8(&bundle, 3) ||
+        !qrr_full_buf_append_le32(&bundle, TARGET_LONG_SIZE) ||
+        !qrr_full_buf_append_le32(&bundle, TARGET_LONG_SIZE) ||
+        !qrr_full_buf_append_le32(
+            &bundle, (uint32_t)env->active_tc.gpr[3])) {
+        goto out;
+    }
+    *payload_bytes = TARGET_LONG_SIZE;
+    hex = qrr_full_hex_from_bytes(bundle.data, bundle.len);
+
+out:
+    qrr_full_buf_free(&bundle);
+    return hex;
+#else
+    (void)cpu;
+    *payload_bytes = 0;
+    return NULL;
+#endif
+}
+
+/* wait-family calls have independent output objects.  A successful reap
+ * writes the target-endian status word through arg2 and wait4, when
+ * requested, writes the complete target struct rusage through arg4.  Store
+ * both as ordinary direct-argument bundle items so replay does not depend on
+ * host wait status or accounting. */
+static char *qrr_full_encode_wait_bundle(CPUState *cpu, int syscall_nr,
+                                         const target_ulong args[6],
+                                         int64_t ret,
+                                         size_t *payload_bytes)
 {
     static const unsigned char magic[] = { 'Q', 'R', 'R', 'B' };
     QrrFullBuffer bundle;
     char *hex = NULL;
 
     *payload_bytes = 0;
-    if (ret <= 0 || (!args[1] && !args[3])) {
+    if (ret <= 0 ||
+        (!args[1] &&
+         (!qrr_full_is_wait4_syscall(syscall_nr) || !args[3]))) {
         return NULL;
     }
     memset(&bundle, 0, sizeof(bundle));
@@ -4961,7 +5035,8 @@ static char *qrr_full_encode_wait4_bundle(CPUState *cpu,
         (args[1] && !qrr_full_append_output_from_guest(
             cpu, &bundle, QRR_FULL_OUTPUT_DIRECT_ARG, 2, 0, args[1],
             QRR_FULL_TARGET_WAIT_STATUS_SIZE)) ||
-        (args[3] && !qrr_full_append_output_from_guest(
+        (qrr_full_is_wait4_syscall(syscall_nr) && args[3] &&
+         !qrr_full_append_output_from_guest(
             cpu, &bundle, QRR_FULL_OUTPUT_DIRECT_ARG, 4, 0, args[3],
             QRR_FULL_TARGET_RUSAGE_SIZE))) {
         goto out;
@@ -8420,14 +8495,26 @@ static void qrr_full_syscall_return(CPUState *cpu, target_ulong return_pc,
                               "mmap_event_capture_failed";
                 fatal_effect_capture = true;
             }
-        } else if (qrr_full_is_wait4_syscall(pending->syscall_nr) &&
-                   ret > 0 &&
-                   (pending->args[1] || pending->args[3])) {
+        } else if (ret >= 0 && qrr_full_is_secondary_return_syscall(
+                                  pending->syscall_nr)) {
             out_arg = QRR_FULL_RESULT_OUT_ARG_BUNDLE;
-            hex = qrr_full_encode_wait4_bundle(cpu, pending->args, ret,
-                                               &output_bytes);
+            hex = qrr_full_encode_secondary_return_bundle(
+                cpu, &output_bytes);
             if (!hex) {
-                skip_reason = "wait4-output-capture-failed";
+                skip_reason = "secondary-return-capture-failed";
+                fatal_effect_capture = true;
+            }
+        } else if (qrr_full_is_wait_syscall(pending->syscall_nr) &&
+                   ret > 0 &&
+                   (pending->args[1] ||
+                    (qrr_full_is_wait4_syscall(pending->syscall_nr) &&
+                     pending->args[3]))) {
+            out_arg = QRR_FULL_RESULT_OUT_ARG_BUNDLE;
+            hex = qrr_full_encode_wait_bundle(cpu, pending->syscall_nr,
+                                              pending->args, ret,
+                                              &output_bytes);
+            if (!hex) {
+                skip_reason = "wait-output-capture-failed";
                 fatal_effect_capture = true;
             }
         } else if (qrr_full_is_select_syscall(pending->syscall_nr)) {
